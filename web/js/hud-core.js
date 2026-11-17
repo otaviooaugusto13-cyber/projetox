@@ -8,7 +8,8 @@
 
   /* ---------- configuração (localStorage) ---------- */
   const KEY = 'jv.cfg';
-  const DEF = { endpoint: '', token: '', tratamento: 'senhor', falar: true, escuta: false, voz: '', velocidade: 1, tom: 0.85 };
+  // hubUrl/hubToken: hub de telemetria na nuvem (Render). hubToken = CC_VIEWER_TOKEN (token de LEITURA; nunca a chave do agente).
+  const DEF = { endpoint: '', token: '', hubUrl: 'https://command-center-hub.onrender.com', hubToken: '', tratamento: 'senhor', falar: true, escuta: false, voz: '', velocidade: 1, tom: 0.85 };
   const cfg = { ...DEF };
   try { Object.assign(cfg, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) { /* armazenamento bloqueado */ }
   const saveCfg = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); return true; } catch (e) { return false; } };
@@ -18,9 +19,19 @@
   const on = (n, fn) => bus.addEventListener(n, e => fn(e.detail));
   const emit = (n, d) => bus.dispatchEvent(new CustomEvent(n, { detail: d }));
 
+  /* ---------- modos de conexão ----------
+   * Hub  : painel no Render lê o hub (HTTPS) com o token de leitura. Não procura agente nenhum.
+   * Agente: endereço do agente informado (aparelhos Smart Life/Alexa, voz) OU painel servido pelo próprio agente (nada configurado).
+   * Com o hub configurado e sem endereço de agente, NENHUMA chamada vai ao agente (antes iam à mesma origem do Render → HTTP 404). */
+  const hubBase = () => (cfg.hubUrl || '').trim().replace(/\/+$/, '');
+  const hubOn = () => !!(cfg.hubToken && hubBase());
+  const agentOn = () => !!((cfg.endpoint || '').trim() || !hubOn());
+
   /* ---------- API do agente ---------- */
   const base = () => (cfg.endpoint || '').trim().replace(/\/+$/, '');
+  const NOAGENT = { ok: false, kind: 'noagent', error: 'Nenhum agente local configurado. Aparelhos e comandos dependem do agente: informe o endereço HTTPS dele em Configurações › Conexão.' };
   async function api(path, { method = 'GET', body, timeout = 9000 } = {}) {
+    if (!agentOn()) return { ...NOAGENT };
     const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), timeout);
     try {
       const r = await fetch(base() + path, {
@@ -30,6 +41,7 @@
       });
       const data = await r.json().catch(() => null);
       if (r.status === 401) return { ok: false, kind: 'auth', error: 'Token recusado pelo agente. Confira o token em Configurações › Conexão.' };
+      if (r.status === 404 && !base()) return { ok: false, kind: 'http', status: 404, data, error: 'Este endereço não é um agente (HTTP 404). Se o painel está no Render, configure o Hub em Configurações › Conexão (URL do hub + token de leitura).' };
       if (!r.ok) return { ok: false, kind: 'http', status: r.status, data, error: (data && (data.error || data.msg)) || `O agente respondeu HTTP ${r.status}` };
       return { ok: true, data };
     } catch (e) {
@@ -41,7 +53,8 @@
   }
 
   /* ---------- estado ---------- */
-  const S = { resumo: null, erro: null, ultimo: 0, lan: [], aparelhos: [], ping: {}, scan: null };
+  const S = { resumo: null, erro: null, ultimo: 0, lan: [], aparelhos: [], ping: {}, scan: null,
+              hub: null, hubErro: null, hubUltimo: 0, hubLan: [], hubScan: null };
   const LIVE = { status: 'idle', tries: 0, nextIn: 0 };   // idle | connecting | open | retrying | auth | unsupported
   const FRESH_MS = 12000;                                   // dado mais velho que isso = "desatualizado"
 
@@ -59,6 +72,7 @@
   /* ---------- polling HTTP: só é usado quando o WebSocket NÃO está aberto ---------- */
   let pollT = null, inflight = null;
   function refresh() {
+    if (!agentOn()) return Promise.resolve({ ...NOAGENT });   // modo hub: sem agente, sem chamada (e sem "Agente inacessível" na tela)
     if (inflight) return inflight;
     inflight = api('/api/home/resumo').then(r => {
       if (r.ok) apply(r.data); else { S.erro = r; emit('data', S); }
@@ -135,19 +149,100 @@
     };
   }
   function startLive() { wantLive = true; LIVE.tries = 0; connect(); }
-  function reconnect() {                                    // após mudar endpoint/token, ou voltar a rede
+  function reconnect() {                                    // após mudar endpoint/token/hub, ou voltar a rede
     teardown(ws); ws = null; clearTimeout(retryT); LIVE.tries = 0; stopPoll();
-    wantLive = true; connect(); refresh();
+    if (agentOn()) { wantLive = true; connect(); refresh(); }
+    else {                                                  // só hub: esquece qualquer dado/erro antigo do agente
+      wantLive = false; setLive('idle');
+      Object.assign(S, { resumo: null, erro: null, ultimo: 0, lan: [], aparelhos: [], ping: {}, scan: null });
+    }
+    stopHub(); if (hubOn()) startHub(); else Object.assign(S, { hub: null, hubErro: null, hubUltimo: 0, hubLan: [], hubScan: null });
+    emit('data', S);
   }
   /* Tela apagada/aba oculta: fecha tudo (zero bateria); ao voltar, reconecta na hora e já pede um dado. */
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') { LIVE.tries = 0; startPoll(5000); connect(); }   // o hello do WS para o polling
+    if (document.visibilityState === 'visible') { if (agentOn()) { LIVE.tries = 0; startPoll(5000); connect(); } }   // o hello do WS para o polling
     else { clearTimeout(retryT); clearInterval(wdT); stopPoll(); teardown(ws); ws = null; if (LIVE.status !== 'auth') setLive('idle'); }
   });
-  window.addEventListener('online', () => { if (wantLive) reconnect(); });
+  window.addEventListener('online', () => { if (wantLive || hubOn()) reconnect(); });
   const connectedNow = () => LIVE.status === 'open' || (S.ultimo && !S.erro && Date.now() - S.ultimo < FRESH_MS);
 
-  function startPolling() { startLive(); startPoll(3000); }   // nome mantido: hud-home.js continua chamando startPolling()
+  /* ---------- HUB (telemetria na nuvem): polling HTTPS de /api/v1/fleet + /api/v1/network ----------
+   * Polling (não SSE) de propósito: os agentes enviam a cada ~15 s, então 5 s já é "ao vivo", e o Render free
+   * atravessa requisições curtas sem problema. Só roda com a tela visível. */
+  const HUB_POLL_MS = 5000, HUB_STALE_MS = 25000;
+  let hubT = null, hubInflight = null, hubStopped = false;
+
+  async function hubApi(path, timeout = 20000) {            // 1ª chamada após o hub "dormir" no plano free pode levar ~30 s
+    const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), timeout);
+    try {
+      const r = await fetch(hubBase() + path, { signal: ctl.signal, cache: 'no-store', headers: { Authorization: 'Bearer ' + cfg.hubToken } });
+      const data = await r.json().catch(() => null);
+      if (r.status === 401) return { ok: false, kind: 'auth', error: 'Token de leitura recusado pelo hub. Use o CC_VIEWER_TOKEN do Render (não o token do agente nem a chave-mestra).' };
+      if (r.status === 429) return { ok: false, kind: 'rate', error: 'O hub bloqueou temporariamente (muitas tentativas). Aguarde 1 minuto.' };
+      if (!r.ok) return { ok: false, kind: 'http', status: r.status, error: `O hub respondeu HTTP ${r.status}.${r.status === 404 ? ' Confira a URL do hub em Configurações › Conexão.' : ''}` };
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, kind: 'net', error: e.name === 'AbortError'
+        ? 'O hub não respondeu a tempo (no plano gratuito ele pode estar acordando; tentando de novo).'
+        : 'Não foi possível alcançar o hub. Confira a URL e se a origem deste painel está em CC_ALLOWED_ORIGINS no Render (bloqueio de CORS aparece assim).' };
+    } finally { clearTimeout(tm); }
+  }
+
+  function applyHub(fleet, net, ms) {                       // ÚNICO ponto que grava dados do hub em S
+    S.hub = { agents: fleet.agents || [], events: fleet.events || [], ts: fleet.server_ts, rx: Date.now(), ms };
+    S.hubErro = null; S.hubUltimo = Date.now();
+    // Lista de dispositivos da LAN: vem do agente que fez a varredura mais recente (o hub só repassa o que o agente enviou).
+    const withNet = ((net && net.agents) || []).filter(a => a.network && Array.isArray(a.network.devices))
+      .sort((a, b) => b.network.scanned_at - a.network.scanned_at);
+    const pick = withNet[0];
+    S.hubScan = pick ? { scanned_at: pick.network.scanned_at, subnet: pick.network.subnet, from: pick.name } : null;
+    S.hubLan = pick ? pick.network.devices.map(d => ({
+      ip: d.ip, mac: d.mac, name: d.name, online: d.status === 'online', status: d.status,
+      latency_ms: d.latency_ms, method: d.method, last_seen: d.last_seen, role: null })) : [];
+    emit('data', S);
+  }
+
+  function hubRefresh() {
+    if (!hubOn()) return Promise.resolve({ ok: false, kind: 'nohub' });
+    if (hubInflight) return hubInflight;
+    const t0 = Date.now();
+    hubInflight = (async () => {
+      const f = await hubApi('/api/v1/fleet');
+      if (!f.ok) {
+        S.hubErro = f; emit('data', S);
+        // Token errado: PARA de insistir. O hub conta falhas por IP e o IP público da sua casa é o mesmo do agente.
+        if (f.kind === 'auth') stopHub(true);
+        return f;
+      }
+      const n = await hubApi('/api/v1/network');            // auxiliar: se falhar, métricas continuam
+      applyHub(f.data, n.ok ? n.data : null, Date.now() - t0);
+      return f;
+    })().finally(() => { hubInflight = null; });
+    return hubInflight;
+  }
+  function startHub() {
+    hubStopped = false;
+    if (hubT || !hubOn()) return;
+    hubT = setInterval(() => { if (!hubStopped && document.visibilityState === 'visible') hubRefresh(); }, HUB_POLL_MS);
+    hubRefresh();
+  }
+  function stopHub(authFail) { clearInterval(hubT); hubT = null; hubStopped = !!authFail; }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && hubOn() && !hubStopped) { startHub(); hubRefresh(); } });
+
+  /* Estado do link com o hub para a barra superior. */
+  function hubStatus() {
+    if (!hubOn()) return null;
+    const e = S.hubErro, fresh = S.hub && Date.now() - S.hubUltimo < HUB_STALE_MS;
+    if (e && e.kind === 'auth') return { s: 'bad', txt: 'token do hub recusado', title: e.error };
+    if (S.hub && !e && fresh) return { s: 'ok', txt: 'hub conectado', title: 'Dados dos agentes via hub, atualizados a cada 5 s.' };
+    if (S.hub) return { s: 'wait', txt: 'hub: reconectando…', title: (e && e.error) || 'Mostrando a última leitura enquanto reconecta.' };
+    if (e) return { s: 'bad', txt: 'hub inacessível', title: e.error };
+    return { s: 'wait', txt: 'conectando ao hub…', title: '' };
+  }
+  const lanView = () => S.resumo ? { lan: S.lan, scan: S.scan, hub: false } : S.hub ? { lan: S.hubLan, scan: S.hubScan, hub: true } : null;
+
+  function startPolling() { if (agentOn()) { startLive(); startPoll(3000); } if (hubOn()) startHub(); }   // nome mantido: hud-home.js continua chamando startPolling()
 
   /* ---------- ações compartilhadas (UI e voz) ---------- */
   async function acao(id, a) {
@@ -210,5 +305,6 @@
   async function keepAwake() { try { if ('wakeLock' in navigator && document.visibilityState === 'visible') lock = await navigator.wakeLock.request('screen'); } catch (e) { /* sem suporte */ } }
   document.addEventListener('visibilitychange', keepAwake); keepAwake();
 
-  window.HUD = { $, $$, esc, cfg, saveCfg, api, S, LIVE, on, emit, refresh, startPolling, reconnect, connectedNow, setHTML, FRESH_MS, acao, icon, ICONS, CAT, estado, ago, toast };
+  window.HUD = { $, $$, esc, cfg, saveCfg, api, S, LIVE, on, emit, refresh, startPolling, reconnect, connectedNow, setHTML, FRESH_MS, acao, icon, ICONS, CAT, estado, ago, toast,
+                 hubOn, agentOn, hubRefresh, hubStatus, lanView, HUB_STALE_MS };
 })();
