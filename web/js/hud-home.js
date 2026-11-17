@@ -13,15 +13,16 @@
   tick(); setInterval(tick, 5000);
 
   /* ---------- navegação ---------- */
-  const VIEWS = ['home', 'devices', 'net'];
+  const VIEWS = ['home', 'devices', 'net', 'fleet'];
   function go(v) {
     if (!VIEWS.includes(v)) v = 'home';
     $$('.seg button').forEach(b => b.classList.toggle('on', b.dataset.v === v));
-    $('#v-home').hidden = v !== 'home'; $('#v-devices').hidden = v !== 'devices'; $('#v-net').hidden = v !== 'net';
+    $('#v-home').hidden = v !== 'home'; $('#v-devices').hidden = v !== 'devices'; $('#v-net').hidden = v !== 'net'; $('#v-fleet').hidden = v !== 'fleet';
+    HUD.emit('view', v);
     try { history.replaceState(null, '', '#' + v); } catch (e) { /* ok */ }
   }
   $$('.seg button').forEach(b => b.onclick = () => go(b.dataset.v));
-  $('#devAll').onclick = () => go('devices');
+  $('#devAll').onclick = () => go(HUD.agentOn() ? 'devices' : 'fleet');
   go(location.hash.slice(1));
 
   /* ---------- acionamento (botões da interface) ---------- */
@@ -42,6 +43,11 @@
   /* ---------- link com o agente (indicador sutil de tempo real / reconexão) ---------- */
   function renderLink() {
     const l = $('#link'), t = $('#linkTxt'), set = (s, txt, title = '') => { l.dataset.s = s; t.textContent = txt; l.title = title; };
+    if (!HUD.agentOn() && HUD.hubOn()) {                      // modo hub: o indicador mostra o hub, não um agente inexistente
+      const h = HUD.hubStatus(); set(h.s, h.txt, h.title);
+      document.body.classList.toggle('stale', !!S.hub && h.s !== 'ok');
+      return;
+    }
     const fresh = HUD.connectedNow();
     if (S.erro && S.erro.kind === 'auth') set('bad', 'token recusado', S.erro.error);
     else if (LIVE.status === 'open') set('ok', 'ao vivo');
@@ -55,7 +61,32 @@
   setInterval(() => { if (document.visibilityState === 'visible') renderLink(); }, 4000);   // detecta "dado ficou velho" sem evento
 
   /* ---------- coluna Rede ---------- */
+  /* Modo hub: coluna Rede resume a frota (o hub não mede ping de internet/roteador; nada disso é inventado aqui). */
+  function renderNetHub() {
+    const v = $('#netVerdict'), sub = $('#netSub'), h = S.hub, e = S.hubErro, lv = HUD.lanView();
+    $('#kvNetL').textContent = 'Hub'; $('#kvGwL').textContent = 'Agentes'; $('#netFoot').textContent = 'Dados enviados pelos agentes ao hub.';
+    const lanOn = lv && lv.lan ? lv.lan.filter(x => x.online).length : null;
+    $('#kvLan').innerHTML = lanOn == null ? '—' : `${lanOn}<small>${lanOn === 1 ? 'dispositivo' : 'dispositivos'}</small>`;
+    if (!h) {
+      $('#kvNet').textContent = $('#kvGw').textContent = '—';
+      if (e) { v.dataset.s = 'bad'; v.textContent = e.kind === 'auth' ? 'Token recusado' : 'Hub inacessível'; sub.textContent = e.error; }
+      else { v.dataset.s = 'wait'; v.textContent = 'Conectando…'; sub.textContent = 'Consultando o hub (no plano gratuito a 1ª resposta pode demorar).'; }
+      return;
+    }
+    const ags = h.agents, n = st => ags.filter(a => a.status === st).length, on = n('online');
+    const bad = n('offline') + n('ghost'), warn = n('degraded') + n('pending');
+    if (!ags.length) { v.dataset.s = 'warn'; v.textContent = 'Sem agentes'; sub.textContent = 'O hub não tem agentes cadastrados (CC_AGENTS).'; }
+    else if (bad) { v.dataset.s = 'bad'; v.textContent = bad === 1 ? 'Um agente offline' : 'Agentes offline'; sub.textContent = ags.filter(a => a.status === 'offline' || a.status === 'ghost').map(a => a.name).join(', ') + ' sem enviar dados.'; }
+    else if (warn) { v.dataset.s = 'warn'; v.textContent = 'Atenção'; sub.textContent = ags.filter(a => a.status !== 'online').map(a => a.name).join(', ') + ' com alerta ou aguardando.'; }
+    else { v.dataset.s = 'ok'; v.textContent = 'Tudo online'; sub.textContent = 'Todos os agentes enviando dados.'; }
+    if (e) sub.textContent = 'Hub sem resposta agora: mostrando a última leitura.';
+    $('#kvNet').innerHTML = `${h.ms}<small>ms</small>`;
+    $('#kvGw').innerHTML = `${on}<small>/ ${ags.length} online</small>`;
+  }
+
   function renderNet() {
+    if (!HUD.agentOn() && HUD.hubOn()) return renderNetHub();
+    $('#kvNetL').textContent = 'Internet'; $('#kvGwL').textContent = 'Roteador'; $('#netFoot').textContent = 'Medido pelo PC onde o agente roda.';
     const v = $('#netVerdict'), sub = $('#netSub'), p = S.ping || {};
     const ms = x => x == null ? '<span class="bad">sem resposta</span>' : `${x}<small>ms</small>`;
     if (S.erro && !S.resumo) {
@@ -80,7 +111,25 @@
   }
 
   /* ---------- coluna Aparelhos (resumo) ---------- */
+  const fcls = st => ({ online: 'on', degraded: 'warn', offline: 'off', ghost: 'ghost' }[st] || 'wait');
+  const FST = { online: 'Online', degraded: 'Degradado', offline: 'Offline', ghost: 'Fantasma', pending: 'Aguardando' };
+  const pc = v => v == null ? '—' : Math.round(v) + '%';
+  function renderMiniHub() {                                 // coluna direita no modo hub: hardware de cada PC
+    const ul = $('#devMini'), sum = $('#devSum'), all = $('#devAll'), h = S.hub;
+    $('#devTitle').textContent = 'Frota';
+    all.textContent = 'Abrir frota';
+    if (!h) { sum.textContent = S.hubErro ? 'Sem dados do hub.' : 'Carregando…'; setHTML(ul, ''); all.hidden = true; return; }
+    const on = h.agents.filter(a => a.status === 'online').length;
+    sum.textContent = `${on} de ${h.agents.length} online`;
+    all.hidden = !h.agents.length;
+    setHTML(ul, h.agents.map(a => { const m = a.metrics || {};
+      return `<li class="${a.status === 'offline' || a.status === 'ghost' ? 'is-off' : ''}"><span class="dot ${fcls(a.status)}"></span>
+        <div><b>${esc(a.name)}</b><small>${a.metrics ? `CPU ${pc(m.cpu)} · RAM ${pc(m.ram)} · Disco ${pc(m.disk)}` : esc(FST[a.status] || a.status)}</small></div></li>`; }).join(''));
+  }
+
   function renderMini() {
+    if (!HUD.agentOn() && HUD.hubOn()) return renderMiniHub();
+    $('#devTitle').textContent = 'Aparelhos';
     const list = S.aparelhos.filter(d => d.categoria !== 'rotina');
     const ul = $('#devMini'), sum = $('#devSum'), all = $('#devAll');
     if (!S.resumo) { sum.textContent = S.erro ? 'Sem dados do agente.' : 'Carregando…'; setHTML(ul, ''); all.hidden = true; return; }
@@ -131,6 +180,7 @@
   }
   function renderGrid() {
     const g = $('#dgrid');
+    if (!HUD.agentOn()) { setHTML(g, '<p class="noitems">Aparelhos Smart Life/Alexa são controlados pelo agente local. Para usá-los, informe o endereço HTTPS do agente em Configurações › Conexão. O hardware dos PCs está na aba Frota.</p>'); return; }
     if (S.erro && !S.resumo) { setHTML(g, `<p class="noitems">${esc(S.erro.error)}</p>`); return; }
     if (!S.resumo) return;
     const list = S.aparelhos.filter(d => filtro === 'todos' || d.categoria === filtro);
@@ -160,12 +210,14 @@
   function renderLan() {
     const grid = $('#ngrid'), msg = $('#nempty'), sum = $('#netSummary');
     const say = t => { msg.hidden = !t; msg.textContent = t || ''; };
-    if (!S.resumo) { say(S.erro ? S.erro.error : 'Carregando…'); sum.textContent = ''; if (S.erro) clearLan(); return; }
-    const on = S.lan.filter(d => d.online).length, sc = S.scan;
-    sum.textContent = sc ? `${on} online · ${S.lan.length - on} offline · ${sc.subnet || 'rede local'} · varredura ${ago(sc.scanned_at)}` : '';
-    say(!sc ? 'Varredura inicial em andamento… os dispositivos aparecem em instantes.' : !S.lan.length ? 'Nenhum dispositivo respondeu na varredura.' : '');
+    const lv = HUD.lanView();                                // agente (se conectado) ou hub
+    if (!lv) { const e = S.erro || S.hubErro; say(e ? e.error : 'Carregando…'); sum.textContent = ''; if (e) clearLan(); return; }
+    const LAN = lv.lan, on = LAN.filter(d => d.online).length, sc = lv.scan;
+    sum.textContent = sc ? `${on} online · ${LAN.length - on} offline · ${sc.subnet || 'rede local'} · varredura ${ago(sc.scanned_at)}${lv.hub && sc.from ? ' · via ' + sc.from : ''}` : '';
+    say(!sc ? (lv.hub ? 'Nenhum agente enviou a lista de dispositivos ao hub ainda. Aguarde a 1ª varredura (o agente precisa estar com CC_NET_SCAN=on).' : 'Varredura inicial em andamento… os dispositivos aparecem em instantes.')
+      : !LAN.length ? 'Nenhum dispositivo respondeu na varredura.' : '');
     const seen = new Set(); let prev = null;
-    for (const d of S.lan) {
+    for (const d of LAN) {
       seen.add(d.mac);
       let n = nodes.get(d.mac);
       if (!n) { const el = document.createElement('article'); n = { el, sig: '' }; nodes.set(d.mac, n); }
