@@ -27,6 +27,7 @@
   /* ====================== APARELHOS ====================== */
   function paneDevs() {
     const p = $('#p-devs');
+    if (!HUD.agentOn()) { editing = null; p.innerHTML = '<p>Aparelhos Smart Life/Alexa são cadastrados e acionados pelo agente local. Em Conexão, informe o endereço HTTPS do agente para usar este recurso. O hub de telemetria (aba Frota) não controla aparelhos.</p>'; return; }
     if (editing) return form(p);
     const lista = S.aparelhos;
     const known = new Set(lista.map(d => d.ip).filter(Boolean));
@@ -119,12 +120,16 @@
   function paneConn() {
     const p = $('#p-conn');
     p.innerHTML = `
-      <h3>Agente (agent.py)</h3>
-      <p>Se você abriu o painel pelo endereço do agente (ex.: <code>http://192.168.0.10:5000</code>), deixe o endereço em branco.
-      Se o painel está hospedado no Render (HTTPS), informe um endpoint HTTPS do agente (Tailscale Serve, mkcert ou túnel).</p>
+      <h3>Hub de telemetria (recomendado no Render)</h3>
+      <p>O painel lê o hub na nuvem, onde o <code>agent.py</code> do PC e do notebook enviam os dados. Informe a URL do hub e o <b>token de leitura</b> (<code>CC_VIEWER_TOKEN</code>, no Render › command-center-hub › Environment). Não use a chave do agente nem a <code>CC_MASTER_KEY</code>.</p>
+      <div class="field"><label for="hUrl">URL do hub</label><input id="hUrl" inputmode="url" value="${esc(cfg.hubUrl)}" placeholder="https://command-center-hub.onrender.com" autocapitalize="off" spellcheck="false"></div>
+      <div class="field"><label for="hTok">Token de leitura (CC_VIEWER_TOKEN)</label><input id="hTok" type="password" autocomplete="off" value="${esc(cfg.hubToken)}"></div>
+      <h3>Agente local (opcional: aparelhos Smart Life/Alexa e voz)</h3>
+      <p>Deixe em branco se você só quer ver a frota pelo hub. Se abriu o painel pelo endereço do próprio agente (ex.: <code>http://192.168.0.10:5000</code>) e não usa hub, também deixe em branco.
+      Com o painel no Render (HTTPS), o agente precisa de um endereço HTTPS (Tailscale Serve, mkcert ou túnel).</p>
       <div class="warnbox" id="cMixed" hidden></div>
-      <div class="field"><label for="cEnd">Endereço do agente</label><input id="cEnd" inputmode="url" value="${esc(cfg.endpoint)}" placeholder="vazio = este mesmo endereço" autocapitalize="off" spellcheck="false"></div>
-      <div class="field"><label for="cTok">Token (impresso no terminal na 1ª execução e salvo em agent/.token)</label><input id="cTok" type="password" autocomplete="off" value="${esc(cfg.token)}"></div>
+      <div class="field"><label for="cEnd">Endereço do agente</label><input id="cEnd" inputmode="url" value="${esc(cfg.endpoint)}" placeholder="vazio = sem agente local" autocapitalize="off" spellcheck="false"></div>
+      <div class="field"><label for="cTok">Token do agente (impresso no terminal na 1ª execução e salvo em agent/.token)</label><input id="cTok" type="password" autocomplete="off" value="${esc(cfg.token)}"></div>
       <div class="actions"><button class="btn" id="cSave">Salvar e testar</button></div>
       <p id="cMsg" class="err" style="margin-top:12px"></p>`;
     const mixed = () => {
@@ -134,11 +139,15 @@
     };
     $('#cEnd').oninput = mixed; mixed();
     $('#cSave').onclick = async () => {
+      cfg.hubUrl = $('#hUrl').value.trim().replace(/\/+$/, ''); cfg.hubToken = $('#hTok').value.trim();
       cfg.endpoint = $('#cEnd').value.trim(); cfg.token = $('#cTok').value.trim(); saveCfg();
-      HUD.reconnect();                                     // reabre o WebSocket com o endpoint/token novos
-      const m = $('#cMsg'); m.className = 'err'; m.textContent = 'Testando…';
-      const r = await refresh();
-      m.className = r.ok ? 'err okmsg' : 'err'; m.textContent = r.ok ? 'Conectado ao agente.' : r.error;
+      HUD.reconnect();                                     // reabre hub/WebSocket com os dados novos
+      const m = $('#cMsg'), res = [];
+      m.className = 'err'; m.textContent = 'Testando…';
+      if (HUD.hubOn()) { const r = await HUD.hubRefresh(); res.push(r.ok ? { ok: true, t: 'Hub conectado.' } : { ok: false, t: 'Hub: ' + r.error }); }
+      if (HUD.agentOn() && cfg.endpoint) { const r = await refresh(); res.push(r.ok ? { ok: true, t: 'Agente conectado.' } : { ok: false, t: 'Agente: ' + r.error }); }
+      if (!res.length) res.push({ ok: false, t: 'Informe o token de leitura do hub (ou o endereço do agente).' });
+      m.className = res.every(x => x.ok) ? 'err okmsg' : 'err'; m.textContent = res.map(x => x.t).join(' ');
     };
   }
 
@@ -175,6 +184,7 @@
   /* ====================== INTEGRAÇÕES ====================== */
   async function paneInteg() {
     const p = $('#p-integ');
+    if (!HUD.agentOn()) { p.innerHTML = '<p>As integrações (Smart Life, Alexa) ficam no agente local. Informe o endereço dele em Conexão para ver o estado delas.</p>'; return; }
     p.innerHTML = '<p>Consultando o agente…</p>';
     const r = await api('/api/home/integracoes');
     if (!r.ok) { p.innerHTML = `<p class="err">${esc(r.error)}</p>`; return; }
@@ -193,5 +203,12 @@
   window.HUDSettings = { novo };
   /* primeiro acesso sem token/endereço: abre direto em Conexão */
   let asked = false;
-  HUD.on('data', () => { if (!asked && S.erro && S.erro.kind === 'auth') { asked = true; tab = 'conn'; $('#btnCfg').click(); } });
+  HUD.on('data', () => {
+    const semConfig = !cfg.hubToken && !cfg.endpoint;                 // painel no Render, nada configurado: o 404 do "agente" é só falta de configuração
+    const e = S.erro;
+    if (!asked && e && (e.kind === 'auth' || (semConfig && e.status === 404))) { asked = true; tab = 'conn'; $('#btnCfg').click(); }
+  });
+  if (!cfg.hubToken && !cfg.endpoint && location.protocol === 'https:' && !asked) {   // 1º acesso no Render: já abre em Conexão
+    asked = true; tab = 'conn'; setTimeout(() => $('#btnCfg').click(), 400);
+  }
 })();
