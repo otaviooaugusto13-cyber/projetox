@@ -28,6 +28,7 @@
       <button class="on" data-v="home">Início</button>
       <button data-v="devices">Aparelhos</button>
       <button data-v="net">Rede</button>
+      <button data-v="fleet">Frota</button>
     </nav>
     <div class="bar-r">
       <span class="link" id="link" role="status"><i></i><span id="linkTxt">conectando…</span></span>
@@ -45,11 +46,11 @@
         <div class="verdict" id="netVerdict" data-s="wait">Verificando…</div>
         <p class="sub" id="netSub">&nbsp;</p>
         <dl class="kv">
-          <div><dt>Internet</dt><dd id="kvNet">—</dd></div>
-          <div><dt>Roteador</dt><dd id="kvGw">—</dd></div>
+          <div><dt id="kvNetL">Internet</dt><dd id="kvNet">—</dd></div>
+          <div><dt id="kvGwL">Roteador</dt><dd id="kvGw">—</dd></div>
           <div><dt>Na rede local</dt><dd id="kvLan">—</dd></div>
         </dl>
-        <p class="foot">Medido pelo PC onde o agente roda.</p>
+        <p class="foot" id="netFoot">Medido pelo PC onde o agente roda.</p>
       </aside>
 
       <div class="stage">
@@ -84,7 +85,7 @@
       </div>
 
       <aside class="col" id="devCol" aria-label="Aparelhos">
-        <h2>Aparelhos</h2>
+        <h2 id="devTitle">Aparelhos</h2>
         <p class="sub" id="devSum">&nbsp;</p>
         <ul class="mini" id="devMini"></ul>
         <button class="more" id="devAll" hidden>Ver todos os aparelhos</button>
@@ -111,6 +112,18 @@
       </div>
       <p class="noitems" id="nempty" hidden></p>
       <div class="dgrid" id="ngrid"></div>
+    </section>
+
+    <!-- ============ FROTA (hardware dos PCs, via hub) ============ -->
+    <section class="devs" id="v-fleet" hidden>
+      <div class="dhead">
+        <h1>Frota</h1>
+        <span class="nsum" id="fleetSum" role="status">&nbsp;</span>
+      </div>
+      <p class="noitems" id="fleetMsg" hidden></p>
+      <div class="dgrid" id="fgrid"></div>
+      <h3 class="fev-h" id="fevH" hidden>Eventos de segurança</h3>
+      <ul class="fev" id="fev"></ul>
     </section>
   </main>
 </div>
@@ -143,6 +156,7 @@
 <script src="js/jarvis-nlu.js"></script>
 <script src="js/jarvis.js"></script>
 <script src="js/hud-home.js"></script>
+<script src="js/hud-fleet.js"></script>
 <script src="js/hud-settings.js"></script>
 </body>
 </html>
