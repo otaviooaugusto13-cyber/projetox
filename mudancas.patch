@@ -1,0 +1,1731 @@
+diff -ruN /tmp/orig/projetox-main/agent/.env.example projetox-main/agent/.env.example
+--- /tmp/orig/projetox-main/agent/.env.example	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/agent/.env.example	2026-11-17 02:54:00.153121091 +0000
+@@ -61,3 +61,14 @@
+ # Alexa: dispare rotinas por webhook. No aparelho use  voicemonkey:ID_DO_MONKEY  ou  ifttt:evento
+ # CC_VOICEMONKEY_TOKEN=
+ # CC_IFTTT_KEY=
++
++# ---------- Rede local (varredura real: ARP + ping/TCP) ----------
++# Segundos entre varreduras (mín. 5)
++# CC_NET_INTERVAL=15
++# Sub-rede a varrer. Padrão: a da interface de saída (máscara real, limitada a /22)
++# CC_NET_CIDR=192.168.0.0/24
++# Horas sem sinal até esquecer um dispositivo offline
++# CC_NET_FORGET_H=72
++# "off" = não envia a lista de dispositivos ao hub
++# CC_NET_SCAN=on
++# Tempo real do painel (WebSocket /ws/live) exige:  pip install flask-sock   (sem ela o painel usa polling)
+diff -ruN /tmp/orig/projetox-main/agent/agent.py projetox-main/agent/agent.py
+--- /tmp/orig/projetox-main/agent/agent.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/agent/agent.py	2026-11-17 02:49:43.962383737 +0000
+@@ -381,52 +381,9 @@
+ # ======================================================================
+ # REDE LOCAL: varredura ARP + detecção de MAC do gateway alterado (ARP spoofing)
+ # ======================================================================
+-_devices, _dev_lock = {}, threading.Lock()
+-MAC_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}).*?([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})")
+-
+-def _local_ip():
+-    try:
+-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+-        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+-        return ip
+-    except Exception:
+-        return None
+-
+-def _read_arp():
+-    """Devolve lista de pares (ip, mac) da tabela ARP, sem broadcast/multicast."""
+-    cmds = [["arp", "-a"]] if platform.system() == "Windows" else [["ip", "neigh"], ["arp", "-an"]]
+-    for cmd in cmds:
+-        try:
+-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+-        except Exception:
+-            continue
+-        pairs = []
+-        for line in out.splitlines():
+-            m = MAC_RE.search(line)
+-            if not m:
+-                continue
+-            ip, mac = m.group(1), m.group(2).upper().replace("-", ":")
+-            if mac == "FF:FF:FF:FF:FF:FF" or mac.startswith("01:00:5E") or ip.startswith(("224.", "239.", "255.")) or ip.endswith(".255"):
+-                continue
+-            pairs.append((ip, mac))
+-        if pairs:
+-            return pairs
+-    return []
+-
+-def _poke(base):
+-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+-    for i in range(1, 255):
+-        try:
+-            s.sendto(b"\0", (f"{base}.{i}", 9))
+-        except OSError:
+-            pass
+-    s.close()
+-
+-def _hostname(ip):
+-    try:
+-        return socket.gethostbyaddr(ip)[0].split(".")[0]
+-    except Exception:
+-        return None
++import netscan
++_local_ip = netscan.local_ip
++_read_arp = netscan.read_arp_pairs     # [(ip, mac)] — também usado pelo smarthome.py
+ 
+ _gw = {"changed": False, "dup": False}
+ def _check_gateway(pairs):
+@@ -449,51 +406,19 @@
+         sec_event("warn", "arp", f"O MAC do gateway também responde por {', '.join(sorted(others))}")
+     _gw["dup"] = bool(others)
+ 
+-def _scan_loop():
+-    from concurrent.futures import ThreadPoolExecutor
+-    ex = ThreadPoolExecutor(4)
+-    while True:
+-        me = _local_ip()
+-        if me:
+-            _poke(me.rsplit(".", 1)[0]); time.sleep(1.5)
+-        pairs = _read_arp()
+-        arp = {mac: ip for ip, mac in pairs}
+-        my_mac = ":".join(f"{uuid.getnode():012X}"[i:i + 2] for i in range(0, 12, 2))
+-        if me:
+-            arp[my_mac] = me
+-        _check_gateway(pairs)
+-        try:
+-            with open(ALIASES_FILE, encoding="utf-8") as f:
+-                aliases = {k.upper(): v for k, v in json.load(f).items()}
+-        except Exception:
+-            aliases = {}
+-        now = time.time()
+-        with _dev_lock:
+-            for mac, ip in arp.items():
+-                d = _devices.setdefault(mac, {"mac": mac, "host": None, "tried": False})
+-                d.update(ip=ip, online=True, last=now)
+-            for mac, d in _devices.items():
+-                if mac not in arp:
+-                    d["online"] = False
+-            todo = [d for d in _devices.values() if d["online"] and not d["host"] and not d["tried"]]
+-        for d in todo:
+-            d["tried"] = True
+-            try:
+-                d["host"] = ex.submit(_hostname, d["ip"]).result(timeout=2)
+-            except Exception:
+-                pass
+-        with _dev_lock:
+-            for mac, d in _devices.items():
+-                d["name"] = aliases.get(mac) or d["host"] or "Dispositivo desconhecido"
+-                d["role"] = "Gateway" if d["ip"] == GATEWAY else "Este PC" if mac == my_mac else None
+-        time.sleep(15)
++# Varredura real (ARP + ping/TCP + histerese) em netscan.py. A telemetria para o hub usa a MESMA instância.
++_scanner = netscan.get_scanner(gateway=GATEWAY, aliases_file=ALIASES_FILE, on_arp=_check_gateway)
+ 
+ def network_list():
++    """Lista real de dispositivos. Mantém as chaves antigas (name/ip/mac/online/role/ago) e acrescenta
++    status, latency_ms (float|None) e method (icmp|tcp|arp|local|None)."""
++    snap = _scanner.snapshot()
+     now = time.time()
+-    with _dev_lock:
+-        devs = sorted(_devices.values(), key=lambda d: (not d["online"], tuple(int(x) for x in d["ip"].split("."))))
+-        return [{"name": d.get("name") or "Dispositivo desconhecido", "ip": d["ip"], "mac": d["mac"], "online": d["online"],
+-                 "role": d.get("role"), "ago": None if d["online"] else int(now - d["last"])} for d in devs]
++    return [{**d, "ago": None if d["online"] else int(now - d["last_seen"])} for d in (snap["devices"] if snap else [])]
++
++def network_meta():
++    snap = _scanner.snapshot()
++    return {"scanned_at": snap["scanned_at"], "subnet": snap["subnet"]} if snap else None
+ 
+ @app.route("/api/network")
+ def network():
+@@ -645,15 +570,21 @@
+ # ======================================================================
+ # CASA INTELIGENTE · Jarvis (aparelhos, Tuya/Smart Life, webhooks/Alexa) -> smarthome.py
+ # ======================================================================
+-import smarthome
++import smarthome, live
++_live = live.LiveBus()
+ _home = smarthome.register(app, here=HERE, ping_once=_ping_once, read_arp=_read_arp, pings=_ping,
+-                           network_list=network_list, event=lambda lv, k, m: sec_event(lv, k, m))
++                           network_list=network_list, network_meta=network_meta, on_change=_live.bump,
++                           event=lambda lv, k, m: sec_event(lv, k, m))
++_scanner.subscribe(_live.bump)
++# Tempo real (WebSocket em /ws/live). Sem a lib flask-sock o painel continua funcionando por polling.
++live.register(app, bus=_live, build_state=_home["resumo"], token=TOKEN, auth=AUTH, origins=ORIGINS)
+ 
+ # ======================================================================
+ if __name__ == "__main__":
+     psutil.cpu_percent()
+     _home["start"]()
+-    for fn in (_net_loop, _ping_loop, _scan_loop, _sec_loop):
++    _scanner.start()
++    for fn in (_net_loop, _ping_loop, _sec_loop):
+         threading.Thread(target=fn, daemon=True).start()
+     for p in CANARY_REQ:
+         threading.Thread(target=_canary, args=(p,), daemon=True).start()
+diff -ruN /tmp/orig/projetox-main/agent/live.py projetox-main/agent/live.py
+--- /tmp/orig/projetox-main/agent/live.py	1970-01-01 00:00:00.000000000 +0000
++++ projetox-main/agent/live.py	2026-11-17 02:50:00.349106836 +0000
+@@ -0,0 +1,118 @@
++"""
++Command Center · tempo real (WebSocket em /ws/live).
++
++Por que assim:
++  * EMPURRA o estado só quando algo muda (ou a cada KEEPALIVE_S como batimento). Cliente ocioso = zero
++    CPU no agente: a thread dorme numa Condition.
++  * Token NÃO vai na URL (apareceria em logs/histórico): o navegador manda {"type":"auth","token":...}
++    como 1ª mensagem, em até AUTH_TIMEOUT_S. Comparação em tempo constante.
++  * Origem verificada: mesma origem do agente ou uma de CC_ORIGINS (se configurada).
++  * Limite de conexões simultâneas e coalescência (no máx. 1 envio por MIN_GAP_S).
++  * Ping/pong de protocolo a cada 25 s derruba conexões meio-abertas (tablet que dormiu).
++
++Protocolo (JSON):
++  cliente -> {"type":"auth","token":"..."}
++  servidor-> {"type":"hello","v":1}                      após autenticar
++  servidor-> {"type":"state","seq":N,"data":{...}}       mesmo formato de GET /api/home/resumo
++  servidor fecha com código 4001 se o token for recusado (o painel NÃO fica tentando de novo).
++
++Dependência: pip install flask-sock   (sem ela o agente sobe normalmente e o painel usa polling HTTP).
++"""
++from __future__ import annotations
++
++import hmac
++import json
++import threading
++import time
++from urllib.parse import urlsplit
++
++AUTH_TIMEOUT_S = 5.0
++KEEPALIVE_S = 5.0          # envia estado mesmo sem mudança: serve de batimento para o watchdog do painel
++MIN_GAP_S = 1.0
++MAX_CLIENTS = 8
++
++
++class LiveBus:
++    """Contador de versão + Condition. bump() é barato e pode ser chamado de qualquer thread."""
++
++    def __init__(self):
++        self._cv = threading.Condition()
++        self.version = 0
++
++    def bump(self) -> None:
++        with self._cv:
++            self.version += 1
++            self._cv.notify_all()
++
++    def wait_change(self, last: int, timeout: float) -> int:
++        with self._cv:
++            if self.version == last:
++                self._cv.wait(timeout)
++            return self.version
++
++
++def origin_allowed(origin: str, host: str, allowed) -> bool:
++    if not origin or "*" in allowed:
++        return True
++    try:
++        netloc = urlsplit(origin).netloc
++    except ValueError:
++        return False
++    return netloc == host or origin.rstrip("/") in allowed
++
++
++def register(app, *, bus: LiveBus, build_state, token: str, auth: bool, origins, max_clients: int = MAX_CLIENTS):
++    """Registra /ws/live. Devolve o objeto Sock, ou None se flask-sock não estiver instalado."""
++    try:
++        from flask import request
++        from flask_sock import Sock
++    except ImportError:
++        print("[aviso] flask-sock não instalado: tempo real por WebSocket desativado (painel usa polling). "
++              "Instale com: pip install flask-sock")
++        return None
++
++    app.config.setdefault("SOCK_SERVER_OPTIONS", {"ping_interval": 25})
++    sock = Sock(app)
++    clients = [0]
++    mu = threading.Lock()
++
++    @sock.route("/ws/live")
++    def ws_live(ws):
++        with mu:
++            if clients[0] >= max_clients:
++                ws.close(reason=1013, message="too many clients")
++                return
++            clients[0] += 1
++        try:
++            if not origin_allowed(request.headers.get("Origin", ""), request.host, origins):
++                ws.close(reason=4003, message="origin")
++                return
++            try:
++                first = json.loads(ws.receive(timeout=AUTH_TIMEOUT_S) or "{}")
++            except (ValueError, TypeError):
++                first = {}
++            if auth:
++                tok = str(first.get("token", "")) if isinstance(first, dict) and first.get("type") == "auth" else ""
++                if not hmac.compare_digest(tok.encode(), token.encode()):
++                    ws.close(reason=4001, message="auth")
++                    return
++            ws.send(json.dumps({"type": "hello", "v": 1}))
++
++            seq, last_ver, last_sent = 0, -1, 0.0
++            while True:
++                last_ver = bus.wait_change(last_ver, KEEPALIVE_S)
++                gap = MIN_GAP_S - (time.monotonic() - last_sent)
++                if gap > 0:
++                    time.sleep(gap)                     # coalesce rajadas de mudanças em 1 envio
++                    last_ver = bus.version
++                seq += 1
++                ws.send(json.dumps({"type": "state", "seq": seq, "data": build_state()},
++                                   separators=(",", ":"), ensure_ascii=False))
++                last_sent = time.monotonic()
++        except Exception:
++            pass                                        # ConnectionClosed ou erro de envio: encerra só esta conexão
++        finally:
++            with mu:
++                clients[0] -= 1
++
++    return sock
+diff -ruN /tmp/orig/projetox-main/agent/netscan.py projetox-main/agent/netscan.py
+--- /tmp/orig/projetox-main/agent/netscan.py	1970-01-01 00:00:00.000000000 +0000
++++ projetox-main/agent/netscan.py	2026-11-17 02:50:38.133629924 +0000
+@@ -0,0 +1,359 @@
++"""
++Command Center · varredura REAL da rede local.
++
++Nenhum dado é inventado: cada dispositivo vem da tabela de vizinhos do sistema operacional
++(`ip neigh` / `arp -a`) e é confirmado por sondagem de verdade (ICMP -> TCP -> ARP).
++
++Como funciona (um ciclo, a cada CC_NET_INTERVAL s, padrão 15):
++  1. "Cutuca" a sub-rede com UDP na porta 9 (barato, não espera resposta). Só serve para o kernel
++     resolver ARP dos hosts vivos: o firewall do alvo não impede o ARP de responder.
++  2. Lê a tabela de vizinhos (com o estado do kernel no Linux: REACHABLE/STALE/FAILED...).
++  3. Sonda só quem importa (vizinhos + dispositivos já conhecidos), em pool pequeno de threads:
++       ping 1 pacote  -> latência em ms (float)
++       senão TCP      -> latência = tempo do connect (aceito OU recusado prova que está vivo)
++       senão ARP      -> vivo, mas SEM latência (None; nunca um número inventado)
++  4. Histerese: só vira "offline" após MISS_LIMIT ciclos seguidos sem sinal. Celular com a tela
++     apagada deixa de responder ping por segundos; sem isso o painel ficaria piscando.
++  5. Nome por DNS reverso roda em threads separadas, uma vez por dispositivo (com nova tentativa
++     espaçada): um DNS lento NUNCA trava o ciclo.
++
++Só biblioteca padrão + psutil (que o agente já usa).
++"""
++from __future__ import annotations
++
++import ipaddress
++import json
++import os
++import platform
++import re
++import socket
++import subprocess
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from typing import Callable, Dict, List, Optional, Tuple
++
++import psutil
++
++IS_WIN = platform.system() == "Windows"
++MISS_LIMIT = 3                         # ciclos sem sinal até declarar offline (3 x 15 s = 45 s)
++MAX_HOSTS = 1022                       # nunca varre mais que um /22
++MAX_DEVICES = 256
++TCP_PORTS = (80, 443, 22, 445, 8009, 62078, 8080)
++TCP_TIMEOUT = 0.3
++PING_TIMEOUT_S = 1
++NAME_RETRY_S = 600
++IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
++NEIGH_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}).*?([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})")
++LAT_RE = re.compile(r"(?:time|tempo)\s*[=<]\s*([\d.,]+)", re.I)
++SAFE_NAME = re.compile(r"[^\w .:/()\[\]+\-@#]", re.UNICODE)    # mesmo alfabeto que o hub aceita
++BAD_STATES = {"FAILED", "INCOMPLETE"}
++
++
++def _ip_key(ip: str) -> Tuple[int, ...]:
++    return tuple(int(x) for x in ip.split("."))
++
++
++def _clean_name(s: Optional[str]) -> Optional[str]:
++    s = SAFE_NAME.sub("", str(s or "")).strip()[:60]
++    return s or None
++
++
++# ----------------------------------------------------------------------------------------------
++# Sistema operacional
++# ----------------------------------------------------------------------------------------------
++def local_ip() -> Optional[str]:
++    """IP de saída da máquina (UDP connect não envia nada)."""
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    try:
++        s.connect(("8.8.8.8", 80))
++        return s.getsockname()[0]
++    except OSError:
++        return None
++    finally:
++        s.close()
++
++
++def local_network() -> Tuple[Optional[str], Optional[ipaddress.IPv4Network], Optional[str]]:
++    """(ip, sub-rede, mac) da interface de saída. Máscara real via psutil; limita a /22."""
++    ip = local_ip()
++    if not ip:
++        return None, None, None
++    mask, mac = "255.255.255.0", None
++    try:
++        for addrs in psutil.net_if_addrs().values():
++            if any(a.family == socket.AF_INET and a.address == ip for a in addrs):
++                for a in addrs:
++                    if a.family == socket.AF_INET and a.address == ip and a.netmask:
++                        mask = a.netmask
++                    elif a.family == psutil.AF_LINK and a.address:
++                        mac = a.address.upper().replace("-", ":")
++                break
++    except Exception:
++        pass
++    override = os.environ.get("CC_NET_CIDR", "").strip()
++    try:
++        net = ipaddress.ip_network(override or f"{ip}/{mask}", strict=False)
++    except ValueError:
++        net = ipaddress.ip_network(f"{ip}/24", strict=False)
++    if net.version != 4 or net.prefixlen < 22:
++        net = ipaddress.ip_network(f"{ip}/24", strict=False)
++    return ip, net, mac
++
++
++def read_neighbors() -> List[Tuple[str, str, Optional[str]]]:
++    """[(ip, mac, estado|None)] da tabela do SO. Sem broadcast/multicast e sem entradas mortas."""
++    cmds = [["arp", "-a"]] if IS_WIN else [["ip", "neigh"], ["arp", "-an"]]
++    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
++    for cmd in cmds:
++        try:
++            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=flags).stdout
++        except Exception:
++            continue
++        rows: Dict[str, Tuple[str, str, Optional[str]]] = {}
++        for line in out.splitlines():
++            m = NEIGH_RE.search(line)
++            if not m:
++                continue
++            ip, mac = m.group(1), m.group(2).upper().replace("-", ":")
++            state = line.split()[-1].upper() if cmd[0] == "ip" and line.split() else None
++            if (state in BAD_STATES or mac == "FF:FF:FF:FF:FF:FF" or mac.startswith("01:00:5E")
++                    or ip.startswith(("224.", "239.", "255.", "127.")) or ip.endswith(".255")
++                    or (IS_WIN and "static" in line.lower())):
++                continue
++            rows[ip] = (ip, mac, state)
++        if rows:
++            return list(rows.values())
++    return []
++
++
++def read_arp_pairs() -> List[Tuple[str, str]]:
++    """Compatível com o que o agent.py/smarthome.py já esperam: [(ip, mac)]."""
++    return [(ip, mac) for ip, mac, _s in read_neighbors()]
++
++
++def ping_ms(ip: str) -> Optional[float]:
++    cmd = (["ping", "-n", "1", "-w", str(PING_TIMEOUT_S * 1000), ip] if IS_WIN
++           else ["ping", "-c", "1", "-W", str(PING_TIMEOUT_S), ip])
++    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
++    try:
++        out = subprocess.run(cmd, capture_output=True, text=True, timeout=PING_TIMEOUT_S + 2,
++                             creationflags=flags).stdout
++    except Exception:
++        return None
++    m = LAT_RE.search(out)           # cobre "time=1.23 ms", "tempo=2ms" e "tempo<1ms" (-> 1.0)
++    return round(float(m.group(1).replace(",", ".")), 1) if m else None
++
++
++def tcp_ms(ip: str, ports=TCP_PORTS, timeout: float = TCP_TIMEOUT) -> Optional[float]:
++    """Conexão aceita OU recusada prova que o host está vivo, mesmo com ICMP bloqueado."""
++    for p in ports:
++        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        s.settimeout(timeout)
++        t0 = time.perf_counter()
++        try:
++            s.connect((ip, p))
++            return round((time.perf_counter() - t0) * 1000, 1)
++        except ConnectionRefusedError:
++            return round((time.perf_counter() - t0) * 1000, 1)
++        except OSError as e:
++            if getattr(e, "winerror", None) == 10061:        # WSAECONNREFUSED
++                return round((time.perf_counter() - t0) * 1000, 1)
++        finally:
++            s.close()
++    return None
++
++
++def probe(ip: str) -> Tuple[Optional[float], Optional[str]]:
++    ms = ping_ms(ip)
++    if ms is not None:
++        return ms, "icmp"
++    ms = tcp_ms(ip)
++    if ms is not None:
++        return ms, "tcp"
++    return None, None
++
++
++# ----------------------------------------------------------------------------------------------
++# Scanner
++# ----------------------------------------------------------------------------------------------
++class NetScanner:
++    def __init__(self, gateway: str = "", aliases_file: str = "", interval_s: float = 15.0,
++                 on_arp: Optional[Callable[[list], None]] = None):
++        self.gateway = gateway
++        self.aliases_file = aliases_file
++        self.interval_s = max(5.0, interval_s)
++        self.on_arp = on_arp
++        self._devs: Dict[str, dict] = {}            # mac -> estado interno
++        self._snap: Optional[dict] = None           # publicado inteiro a cada ciclo (nunca mutado)
++        self._lock = threading.Lock()
++        self._stop = threading.Event()
++        self._thread: Optional[threading.Thread] = None
++        self._listeners: List[Callable[[], None]] = []
++        self._names = ThreadPoolExecutor(2, thread_name_prefix="cc-dns")
++        self._alias_cache: Tuple[float, dict] = (-1.0, {})
++        self.forget_s = float(os.environ.get("CC_NET_FORGET_H", "72")) * 3600
++
++    # ---- API pública
++    def start(self) -> None:
++        with self._lock:
++            if self._thread and self._thread.is_alive():
++                return
++            self._stop.clear()
++            self._thread = threading.Thread(target=self._loop, name="cc-netscan", daemon=True)
++            self._thread.start()
++
++    def stop(self) -> None:
++        self._stop.set()
++
++    def subscribe(self, fn: Callable[[], None]) -> None:
++        self._listeners.append(fn)
++
++    def snapshot(self) -> Optional[dict]:
++        """{'scanned_at', 'subnet', 'devices': [...]} ou None até a 1ª varredura terminar."""
++        return self._snap
++
++    # ---- internals
++    def _aliases(self) -> dict:
++        if not self.aliases_file:
++            return {}
++        try:
++            mt = os.path.getmtime(self.aliases_file)
++            if mt != self._alias_cache[0]:
++                with open(self.aliases_file, encoding="utf-8") as f:
++                    self._alias_cache = (mt, {k.upper(): v for k, v in json.load(f).items()})
++        except (OSError, ValueError, AttributeError):
++            self._alias_cache = (-1.0, {})
++        return self._alias_cache[1]
++
++    def _resolve_name(self, mac: str, ip: str) -> None:
++        try:
++            host = socket.gethostbyaddr(ip)[0].split(".")[0]
++        except Exception:
++            host = None
++        with self._lock:
++            d = self._devs.get(mac)
++            if d is not None:
++                d["host"] = _clean_name(host)
++
++    def _loop(self) -> None:
++        while not self._stop.is_set():
++            t0 = time.monotonic()
++            try:
++                self._cycle()
++            except Exception as e:                    # o scanner nunca derruba o agente
++                print(f"[aviso] varredura de rede: {e.__class__.__name__}: {e}")
++            self._stop.wait(max(1.0, self.interval_s - (time.monotonic() - t0)))
++
++    def _poke(self, me: str, net: ipaddress.IPv4Network) -> None:
++        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        try:
++            for i, h in enumerate(net.hosts()):
++                if i >= MAX_HOSTS:
++                    break
++                if str(h) != me:
++                    try:
++                        s.sendto(b"\0", (str(h), 9))
++                    except OSError:
++                        pass
++        finally:
++            s.close()
++
++    def _cycle(self) -> None:
++        me, net, my_mac = local_network()
++        if me and net:
++            self._poke(me, net)
++            self._stop.wait(1.2)                      # tempo para o kernel resolver ARP
++        neigh = read_neighbors()
++        if self.on_arp:
++            try:
++                self.on_arp([(ip, mac) for ip, mac, _s in neigh])
++            except Exception:
++                pass
++        neigh_by_mac = {mac: (ip, st) for ip, mac, st in neigh}
++        ip_owner = {ip: mac for ip, mac, _s in neigh}
++
++        with self._lock:                              # alvos: vizinhos atuais + já conhecidos cujo IP ninguém tomou
++            entries = {mac: ip for mac, (ip, _s) in neigh_by_mac.items()}
++            for mac, d in self._devs.items():
++                if mac not in entries and ip_owner.get(d["ip"], mac) == mac and d.get("method") != "local":
++                    entries[mac] = d["ip"]
++        entries.pop(my_mac or "", None)
++        order = sorted(set(entries.values()) - {me or ""}, key=_ip_key)[:MAX_DEVICES]
++        with ThreadPoolExecutor(min(12, max(1, len(order)))) as ex:
++            results = dict(zip(order, ex.map(probe, order)))
++
++        now = time.time()
++        aliases = self._aliases()
++        with self._lock:
++            if me and my_mac:
++                d = self._devs.setdefault(my_mac, {"mac": my_mac, "first": now, "misses": 0, "name_try": 0.0,
++                                                   "host": _clean_name(socket.gethostname())})
++                d.update(ip=me, online=True, last_seen=now, latency_ms=None, method="local", role="Este PC")
++            for mac, ip in entries.items():
++                if ip not in results:                 # cortado pelo limite MAX_DEVICES
++                    continue
++                d = self._devs.setdefault(mac, {"mac": mac, "ip": ip, "first": now, "misses": 0, "host": None,
++                                                "name_try": 0.0, "online": False, "last_seen": 0.0, "role": None})
++                d["ip"] = ip
++                ms, how = results[ip]
++                seen = neigh_by_mac.get(mac)
++                if how:                               # ICMP ou TCP: prova direta
++                    d.update(online=True, misses=0, last_seen=now, latency_ms=ms, method=how)
++                elif seen and seen[1] in (None, "REACHABLE"):
++                    d.update(online=True, misses=0, last_seen=now, latency_ms=None, method="arp")
++                else:
++                    d["misses"] += 1
++                    d["latency_ms"] = None
++                    if d["misses"] >= MISS_LIMIT:
++                        d["online"], d["method"] = False, None
++                d["role"] = "Gateway" if ip == self.gateway else None
++            for mac, d in self._devs.items():         # sem entrada neste ciclo (IP tomado por outro / sumiu do ARP)
++                if mac not in entries and d.get("method") != "local" and mac != my_mac:
++                    d["misses"] += 1
++                    d["latency_ms"] = None
++                    if d["misses"] >= MISS_LIMIT:
++                        d["online"], d["method"] = False, None
++            for mac in [m for m, d in self._devs.items() if now - d.get("last_seen", 0) > self.forget_s]:
++                del self._devs[mac]
++            todo = [(m, d["ip"]) for m, d in self._devs.items()
++                    if d.get("online") and not d.get("host") and now - d["name_try"] > NAME_RETRY_S]
++            for m, _ip in todo:
++                self._devs[m]["name_try"] = now
++            devs = []
++            for mac, d in self._devs.items():
++                devs.append({
++                    "ip": d["ip"], "mac": mac, "name": _clean_name(aliases.get(mac)) or d.get("host") or "Dispositivo desconhecido",
++                    "online": bool(d["online"]), "status": "online" if d["online"] else "offline",
++                    "latency_ms": d.get("latency_ms"), "method": d.get("method"),
++                    "role": d.get("role"), "last_seen": round(d.get("last_seen", 0.0), 1),
++                })
++            devs.sort(key=lambda x: (not x["online"], _ip_key(x["ip"])))
++            self._snap = {"scanned_at": round(now, 1), "subnet": str(net) if net else None, "devices": devs}
++        for m, ip in todo:
++            self._names.submit(self._resolve_name, m, ip)
++        for fn in list(self._listeners):
++            try:
++                fn()
++            except Exception:
++                pass
++
++
++# ---------------------------------------------------------------------------------------------- singleton
++_singleton: Optional[NetScanner] = None
++_singleton_mu = threading.Lock()
++
++
++def get_scanner(gateway: Optional[str] = None, aliases_file: Optional[str] = None,
++                on_arp: Optional[Callable[[list], None]] = None) -> NetScanner:
++    """Uma única instância por processo: o agent.py e a telemetria compartilham a mesma varredura."""
++    global _singleton
++    with _singleton_mu:
++        if _singleton is None:
++            here = os.path.dirname(os.path.abspath(__file__))
++            _singleton = NetScanner(
++                gateway=gateway if gateway is not None else os.environ.get("CC_GATEWAY", "192.168.0.1"),
++                aliases_file=aliases_file if aliases_file is not None else os.path.join(here, "devices.json"),
++                interval_s=float(os.environ.get("CC_NET_INTERVAL", "15") or 15),
++                on_arp=on_arp)
++        return _singleton
+diff -ruN /tmp/orig/projetox-main/agent/smarthome.py projetox-main/agent/smarthome.py
+--- /tmp/orig/projetox-main/agent/smarthome.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/agent/smarthome.py	2026-11-17 02:49:43.962825082 +0000
+@@ -352,7 +352,7 @@
+ # ----------------------------------------------------------------------------------------------
+ # Registro no Flask
+ # ----------------------------------------------------------------------------------------------
+-def register(app, *, here, ping_once, read_arp, pings, network_list, event=None):
++def register(app, *, here, ping_once, read_arp, pings, network_list, network_meta=None, on_change=None, event=None):
+     """Plugar no agent.py. `ping_once(ip)` -> ms|None · `read_arp()` -> [(ip, mac)] · `pings` -> dict de latências
+     gateway/internet · `network_list()` -> lista da varredura ARP já existente."""
+     bp = Blueprint("home", __name__)
+@@ -404,9 +404,17 @@
+                 _cycle()
+             except Exception as e:           # nunca derruba o agente
+                 print(f"[aviso] ciclo casa inteligente: {e.__class__.__name__}: {e}")
++            _notify()
+             wake.wait(poll)
+             wake.clear()
+ 
++    def _notify():
++        if on_change:
++            try:
++                on_change()
++            except Exception:
++                pass
++
+     def view(d):
+         with mu:
+             st = dict(status.get(d["id"], {}))
+@@ -507,23 +515,31 @@
+             ok, msg = False, str(e)
+         with mu:
+             last_cmd[did] = {"acao": acao, "ok": ok, "msg": msg, "ts": time.time()}
++        _notify()
+         if event:
+             event("info" if ok else "warn", "casa", f"{d['nome']}: {acao} {'ok' if ok else 'falhou'} ({msg})")
+         return jsonify({"ok": ok, "acao": acao, "msg": msg, "device": view(d)}), (200 if ok else 502)
+ 
+-    @bp.route("/api/home/resumo")
+-    def resumo():
++    def build_resumo():
+         devs = [view(d) for d in store.list()]
+         try:
+             lan = network_list()
+         except Exception:
+             lan = []
+-        return jsonify({
++        try:
++            scan = network_meta() if network_meta else None
++        except Exception:
++            scan = None
++        return {
+             "ts": time.time(),
+             "rede": {"ping": dict(pings), "lan_online": sum(1 for x in lan if x.get("online")),
+-                     "lan": lan},
++                     "lan": lan, "scan": scan},
+             "aparelhos": devs,
+-        })
++        }
++
++    @bp.route("/api/home/resumo")
++    def resumo():
++        return jsonify(build_resumo())
+ 
+     @bp.route("/api/home/integracoes")
+     def integracoes():
+@@ -538,4 +554,5 @@
+         return jsonify({"ok": True})
+ 
+     app.register_blueprint(bp)
+-    return {"start": lambda: threading.Thread(target=_loop, daemon=True).start(), "tuya": tuya, "store": store}
++    return {"start": lambda: threading.Thread(target=_loop, daemon=True).start(), "tuya": tuya, "store": store,
++            "resumo": build_resumo}
+diff -ruN /tmp/orig/projetox-main/agent/telemetry/collectors.py projetox-main/agent/telemetry/collectors.py
+--- /tmp/orig/projetox-main/agent/telemetry/collectors.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/agent/telemetry/collectors.py	2026-11-17 02:51:03.119115401 +0000
+@@ -20,6 +20,7 @@
+ from .config import AGENT_VERSION, AgentConfig
+ 
+ PROC_TTL_S = 30
++MAX_NET_DEVICES = 120          # ~17 KB no pior caso; o hub aceita corpo de até 64 KB
+ 
+ 
+ class Collector:
+@@ -84,6 +85,27 @@
+             out.append({"name": s["name"], "ok": ok, "critical": s.get("critical", True)})
+         return out
+ 
++    # ---------------- rede local (estado atual, NÃO série temporal) ----------------
++    @staticmethod
++    def network() -> Optional[dict]:
++        """Dispositivos REAIS da LAN vistos pelo netscan (ARP + ping/TCP). None = sem dados ainda ou desativado
++        (CC_NET_SCAN=off). Vai no envelope, não em cada amostra: o buffer offline continua pequeno."""
++        if os.environ.get("CC_NET_SCAN", "on").lower() == "off":
++            return None
++        try:
++            from netscan import get_scanner          # agent/netscan.py (mesma instância do agent.py quando embutido)
++        except ImportError:
++            return None
++        sc = get_scanner()
++        sc.start()                                    # idempotente; no modo standalone é quem inicia a varredura
++        snap = sc.snapshot()
++        if not snap:
++            return None
++        devs = [{"ip": d["ip"], "mac": d["mac"], "name": d["name"], "status": d["status"],
++                 "latency_ms": d["latency_ms"], "method": d["method"], "last_seen": d["last_seen"]}
++                for d in snap["devices"][:MAX_NET_DEVICES]]          # já vem online primeiro
++        return {"scanned_at": snap["scanned_at"], "subnet": snap["subnet"], "devices": devs}
++
+     # ---------------- amostra completa ----------------
+     async def sample(self, rtt_ms: Optional[float]) -> dict:
+         self.seq += 1
+diff -ruN /tmp/orig/projetox-main/agent/telemetry/heartbeat.py projetox-main/agent/telemetry/heartbeat.py
+--- /tmp/orig/projetox-main/agent/telemetry/heartbeat.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/agent/telemetry/heartbeat.py	2026-11-17 02:51:03.119743807 +0000
+@@ -110,6 +110,12 @@
+         payload = {"v": 1, "agent_id": self.cfg.agent_id, "agent_version": AGENT_VERSION,
+                    "interval_s": self.cfg.interval_s, "host": self._host,
+                    "samples": [{k: v for k, v in s.items() if k != "_k"} for s in batch]}
++        try:
++            net = self.col.network()                 # snapshot atual da LAN; falha aqui nunca bloqueia as métricas
++        except Exception:
++            net = None
++        if net:
++            payload["network"] = net
+         r = await self.client.send(payload)
+         if r.ok:
+             self.buf.commit_upto(batch[-1]["_k"])
+diff -ruN /tmp/orig/projetox-main/agent/tests/test_live.py projetox-main/agent/tests/test_live.py
+--- /tmp/orig/projetox-main/agent/tests/test_live.py	1970-01-01 00:00:00.000000000 +0000
++++ projetox-main/agent/tests/test_live.py	2026-11-17 02:50:17.907873851 +0000
+@@ -0,0 +1,99 @@
++import json, os, sys, threading, time, types, unittest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++from flask import Flask
++
++
++class FakeWS:
++    def __init__(self, incoming):
++        self.incoming, self.sent, self.closed = list(incoming), [], None
++        self.stop_after = None
++
++    def receive(self, timeout=None):
++        return self.incoming.pop(0) if self.incoming else None
++
++    def send(self, data):
++        self.sent.append(json.loads(data))
++        if self.stop_after and len(self.sent) >= self.stop_after:
++            raise ConnectionError("fechado")           # simula cliente que saiu
++
++    def close(self, reason=None, message=None):
++        self.closed = reason
++
++
++def install_fake_flask_sock():
++    mod = types.ModuleType("flask_sock")
++    class Sock:
++        handlers = {}
++        def __init__(self, app): pass
++        def route(self, path):
++            def deco(fn):
++                Sock.handlers[path] = fn
++                return fn
++            return deco
++    mod.Sock = Sock
++    sys.modules["flask_sock"] = mod
++    return Sock
++
++
++class LiveTests(unittest.TestCase):
++    def setUp(self):
++        import importlib, live
++        importlib.reload(live)
++        self.live = live
++        self.Sock = install_fake_flask_sock()
++        self.app = Flask(__name__)
++        self.bus = live.LiveBus()
++        live.MIN_GAP_S = 0.0
++        live.KEEPALIVE_S = 0.2
++        live.register(self.app, bus=self.bus, build_state=lambda: {"n": 1}, token="segredo", auth=True, origins=["*"])
++        self.handler = self.Sock.handlers["/ws/live"]
++
++    def run_handler(self, ws, origin="http://x", host="localhost"):
++        with self.app.test_request_context("/ws/live", headers={"Origin": origin, "Host": host}):
++            self.handler(ws)
++
++    def test_token_errado_fecha_com_4001(self):
++        ws = FakeWS([json.dumps({"type": "auth", "token": "errado"})])
++        self.run_handler(ws)
++        self.assertEqual(ws.closed, 4001); self.assertEqual(ws.sent, [])
++
++    def test_sem_auth_fecha_com_4001(self):
++        ws = FakeWS([None])
++        self.run_handler(ws)
++        self.assertEqual(ws.closed, 4001)
++
++    def test_token_ok_recebe_hello_e_estado_e_keepalive(self):
++        ws = FakeWS([json.dumps({"type": "auth", "token": "segredo"})]); ws.stop_after = 3
++        self.run_handler(ws)
++        self.assertEqual([m["type"] for m in ws.sent], ["hello", "state", "state"][:len(ws.sent)])
++        self.assertEqual(ws.sent[1]["data"], {"n": 1}); self.assertEqual(ws.sent[1]["seq"], 1)
++
++    def test_bump_acorda_antes_do_keepalive(self):
++        self.live.KEEPALIVE_S = 30
++        ws = FakeWS([json.dumps({"type": "auth", "token": "segredo"})]); ws.stop_after = 3
++        threading.Timer(0.2, self.bus.bump).start()
++        t0 = time.monotonic(); self.run_handler(ws)
++        self.assertLess(time.monotonic() - t0, 5)
++
++    def test_origem_bloqueada(self):
++        self.app = Flask(__name__)
++        self.live.register(self.app, bus=self.bus, build_state=dict, token="t", auth=False, origins=["https://ok.example"])
++        self.handler = self.Sock.handlers["/ws/live"]
++        ws = FakeWS([json.dumps({"type": "auth", "token": ""})])
++        self.run_handler(ws, origin="https://evil.example")
++        self.assertEqual(ws.closed, 4003)
++
++    def test_origin_allowed_helper(self):
++        f = self.live.origin_allowed
++        self.assertTrue(f("http://192.168.0.5:5000", "192.168.0.5:5000", ["https://ok"]))
++        self.assertTrue(f("https://ok/", "x", ["https://ok"]))
++        self.assertFalse(f("https://evil", "x", ["https://ok"]))
++
++    def test_sem_flask_sock_nao_quebra(self):
++        sys.modules["flask_sock"] = None               # força ImportError
++        self.assertIsNone(self.live.register(Flask("y"), bus=self.bus, build_state=dict, token="t", auth=True, origins=["*"]))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN /tmp/orig/projetox-main/agent/tests/test_netscan.py projetox-main/agent/tests/test_netscan.py
+--- /tmp/orig/projetox-main/agent/tests/test_netscan.py	1970-01-01 00:00:00.000000000 +0000
++++ projetox-main/agent/tests/test_netscan.py	2026-11-17 02:49:32.159356987 +0000
+@@ -0,0 +1,91 @@
++import ipaddress, os, sys, unittest
++from unittest import mock
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import netscan as ns
++
++
++class ScanCycle(unittest.TestCase):
++    def setUp(self):
++        self.neigh = []
++        self.probes = {}
++        net = ipaddress.ip_network("192.168.0.0/24")
++        self.patches = [
++            mock.patch.object(ns, "local_network", return_value=("192.168.0.10", net, "AA:00:00:00:00:10")),
++            mock.patch.object(ns, "read_neighbors", side_effect=lambda: list(self.neigh)),
++            mock.patch.object(ns, "probe", side_effect=lambda ip: self.probes.get(ip, (None, None))),
++            mock.patch.object(ns.NetScanner, "_poke", return_value=None),
++            mock.patch.object(ns.NetScanner, "_resolve_name", return_value=None),
++        ]
++        for p in self.patches:
++            p.start()
++        self.sc = ns.NetScanner(gateway="192.168.0.1")
++        self.sc._stop.wait = lambda *_a, **_k: False       # sem esperar 1,2 s nos testes
++
++    def tearDown(self):
++        for p in self.patches:
++            p.stop()
++
++    def devs(self):
++        return {d["mac"]: d for d in self.sc.snapshot()["devices"]}
++
++    def test_online_com_latencia_real_e_papeis(self):
++        self.neigh = [("192.168.0.1", "A4:00:00:00:00:01", "REACHABLE"), ("192.168.0.23", "3C:00:00:00:00:23", "STALE")]
++        self.probes = {"192.168.0.1": (2.5, "icmp"), "192.168.0.23": (None, "tcp") and (8.1, "tcp")}
++        self.sc._cycle()
++        d = self.devs()
++        self.assertEqual(d["A4:00:00:00:00:01"]["latency_ms"], 2.5)
++        self.assertEqual(d["A4:00:00:00:00:01"]["role"], "Gateway")
++        self.assertEqual(d["3C:00:00:00:00:23"]["method"], "tcp")
++        self.assertEqual(d["AA:00:00:00:00:10"]["role"], "Este PC")
++        self.assertEqual(self.sc.snapshot()["subnet"], "192.168.0.0/24")
++
++    def test_histerese_so_fica_offline_apos_varios_ciclos(self):
++        self.neigh = [("192.168.0.23", "3C:00:00:00:00:23", "STALE")]
++        self.probes = {"192.168.0.23": (5.0, "icmp")}
++        self.sc._cycle()
++        self.probes = {}                                      # celular dormiu: sem ping/TCP, ARP só STALE
++        for i in range(ns.MISS_LIMIT - 1):
++            self.sc._cycle()
++            self.assertTrue(self.devs()["3C:00:00:00:00:23"]["online"], f"ciclo {i}")
++        self.sc._cycle()
++        x = self.devs()["3C:00:00:00:00:23"]
++        self.assertFalse(x["online"]); self.assertEqual(x["status"], "offline"); self.assertIsNone(x["latency_ms"])
++
++    def test_ip_trocado_por_dhcp_nao_deixa_fantasma_online(self):
++        self.neigh = [("192.168.0.50", "11:00:00:00:00:11", "REACHABLE")]
++        self.probes = {"192.168.0.50": (3.0, "icmp")}
++        self.sc._cycle()
++        self.neigh = [("192.168.0.50", "22:00:00:00:00:22", "REACHABLE")]   # outro aparelho pegou o IP
++        self.probes = {"192.168.0.50": (4.0, "icmp")}
++        for _ in range(ns.MISS_LIMIT + 1):
++            self.sc._cycle()
++        d = self.devs()
++        self.assertTrue(d["22:00:00:00:00:22"]["online"])
++        self.assertFalse(d["11:00:00:00:00:11"]["online"])
++
++    def test_nome_do_alias_e_sanitizado(self):
++        self.neigh = [("192.168.0.9", "33:00:00:00:00:33", "REACHABLE")]
++        self.sc._aliases = lambda: {"33:00:00:00:00:33": "<b>Sala</b>\"x\""}
++        self.probes = {"192.168.0.9": (1.0, "icmp")}
++        self.sc._cycle()
++        self.assertEqual(self.devs()["33:00:00:00:00:33"]["name"], "bSala/bx")
++
++
++class Parsers(unittest.TestCase):
++    def test_regex_de_latencia_en_e_ptbr(self):
++        for txt, v in (("time=1.23 ms", 1.23), ("tempo=2ms", 2.0), ("tempo<1ms", 1.0), ("time=12,5 ms", 12.5)):
++            self.assertEqual(round(float(ns.LAT_RE.search(txt).group(1).replace(",", ".")), 2), v)
++
++    def test_neighbors_linux_ignora_failed_e_multicast(self):
++        out = ("192.168.0.1 dev wlan0 lladdr a4:2b:b0:1c:55:90 REACHABLE\n"
++               "192.168.0.7 dev wlan0  FAILED\n"
++               "224.0.0.251 dev wlan0 lladdr 01:00:5e:00:00:fb PERMANENT\n"
++               "192.168.0.23 dev wlan0 lladdr 3c:5a:b4:91:0e:d2 STALE\n")
++        with mock.patch.object(ns.subprocess, "run", return_value=mock.Mock(stdout=out)), mock.patch.object(ns, "IS_WIN", False):
++            got = ns.read_neighbors()
++        self.assertEqual(got, [("192.168.0.1", "A4:2B:B0:1C:55:90", "REACHABLE"), ("192.168.0.23", "3C:5A:B4:91:0E:D2", "STALE")])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN /tmp/orig/projetox-main/hub/cc_hub/fleet.py projetox-main/hub/cc_hub/fleet.py
+--- /tmp/orig/projetox-main/hub/cc_hub/fleet.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/hub/cc_hub/fleet.py	2026-11-17 02:51:03.120446624 +0000
+@@ -72,6 +72,7 @@
+         self.history: "collections.deque[list]" = collections.deque(maxlen=HISTORY)
+         self.requests: "collections.deque[float]" = collections.deque(maxlen=200)   # rate limit por agente
+         self.skew_s = 0.0                                # (relógio do agente - relógio do hub) no último envio
++        self.network: Optional[dict] = None              # último snapshot da LAN (maior scanned_at)
+ 
+ 
+ class FleetStore:
+@@ -119,6 +120,9 @@
+                     ag.sample = s
+                 m = s["metrics"]
+                 ag.history.append([round(s["ts"], 1), round(m["cpu"], 1), round(m["ram"], 1)])
++            net = head.get("network")
++            if net and (ag.network is None or net["scanned_at"] >= ag.network["scanned_at"]):
++                ag.network = net                          # backlog antigo reenviado não sobrescreve o mais novo
+             ag.history = collections.deque(sorted(ag.history), maxlen=HISTORY)
+             if len(samples) > 1 and accepted:
+                 ag.backlog_flushes += 1
+@@ -179,6 +183,9 @@
+             "metrics": s["metrics"] if s else None, "services": s["services"] if s else [],
+             "history": list(ag.history), "rx_samples": ag.rx_samples,
+             "backlog_flushes": ag.backlog_flushes,
++            "net": None if not ag.network else {
++                "online": sum(1 for d in ag.network["devices"] if d["status"] == "online"),
++                "total": len(ag.network["devices"]), "scanned_at": ag.network["scanned_at"]},
+             "alerts": self.sec.for_agent(ag.id, now),
+         }
+ 
+@@ -188,6 +195,11 @@
+             agents = [self.summary(a, now) for a in self.agents.values()]
+         return {"server_ts": now, "agents": agents, "events": self.sec.recent()}
+ 
++    def network_snapshot(self) -> dict:
++        """Lista de dispositivos por agente (só leitura; separada do SSE para não inflar cada evento)."""
++        with self._lock:
++            return {"agents": [{"id": a.id, "name": a.name, "network": a.network} for a in self.agents.values()]}
++
+     def signature(self, now: float) -> dict:
+         """Impressão digital leve do estado visível (status + motivos) para só publicar quando mudar."""
+         with self._lock:
+diff -ruN /tmp/orig/projetox-main/hub/cc_hub/schema.py projetox-main/hub/cc_hub/schema.py
+--- /tmp/orig/projetox-main/hub/cc_hub/schema.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/hub/cc_hub/schema.py	2026-11-17 02:51:03.120173634 +0000
+@@ -17,6 +17,11 @@
+ TXT_RE = re.compile(r"^[\w .:/()\[\]+\-@#]{0,60}$", re.UNICODE)      # sem <, >, aspas, crases, controle
+ BOOT_RE = re.compile(r"^[0-9a-f]{8,40}$")
+ FLAG_RE = re.compile(r"^[a-z0-9_]{1,32}$")
++IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
++MAC_RE = re.compile(r"^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$")
++CIDR_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
++NET_METHODS = frozenset({"icmp", "tcp", "arp", "local"})
++MAX_NET_DEVICES = 128
+ 
+ 
+ class SchemaError(ValueError):
+@@ -84,6 +89,42 @@
+             "metrics": metrics, "services": services, "flags": flags}
+ 
+ 
++def _network(n: Any, now: float, skew: int) -> dict:
++    """Lista real de dispositivos da LAN. Lista branca: só ip, mac, name, status, latency_ms, method, last_seen."""
++    if not isinstance(n, dict):
++        raise SchemaError("network inválido")
++    scanned = _num(n.get("scanned_at"), "scanned_at", 1.6e9, 4.0e9)
++    if scanned > now + skew:
++        raise SchemaError("scanned_at no futuro")
++    subnet = n.get("subnet")
++    if subnet is not None and not (isinstance(subnet, str) and CIDR_RE.match(subnet)):
++        raise SchemaError("subnet inválida")
++    devs_in = n.get("devices")
++    if not isinstance(devs_in, list) or len(devs_in) > MAX_NET_DEVICES:
++        raise SchemaError(f"devices: até {MAX_NET_DEVICES} itens")
++    devs, seen = [], set()
++    for d in devs_in:
++        if not isinstance(d, dict):
++            raise SchemaError("device inválido")
++        ip, mac = d.get("ip"), d.get("mac")
++        if not (isinstance(ip, str) and IPV4_RE.match(ip)) or not (isinstance(mac, str) and MAC_RE.match(mac)):
++            raise SchemaError("device ip/mac inválido")
++        if mac in seen:
++            raise SchemaError("device duplicado")
++        seen.add(mac)
++        status = d.get("status")
++        if status not in ("online", "offline"):
++            raise SchemaError("device status inválido")
++        method = d.get("method")
++        if method is not None and method not in NET_METHODS:
++            raise SchemaError("device method inválido")
++        devs.append({"ip": ip, "mac": mac, "name": _txt(d.get("name", "?"), "device.name"), "status": status,
++                     "latency_ms": _num(d.get("latency_ms"), "latency_ms", 0, 60_000, optional=True),
++                     "method": method,
++                     "last_seen": _num(d.get("last_seen"), "last_seen", 0, 4.0e9, optional=True)})
++    return {"scanned_at": scanned, "subnet": subnet, "devices": devs}
++
++
+ def validate_envelope(obj: Any, now: float, max_samples: int, skew: int) -> Tuple[dict, list]:
+     """Devolve (cabeçalho_limpo, amostras_limpas) ou levanta SchemaError."""
+     if not isinstance(obj, dict) or obj.get("v") != 1:
+@@ -99,4 +140,10 @@
+     if not isinstance(samples_in, list) or not 1 <= len(samples_in) <= max_samples:
+         raise SchemaError(f"samples: 1..{max_samples} itens")
+     samples = [_sample(s, now, skew) for s in samples_in]
+-    return ({"agent_id": agent_id, "version": ver, "interval_s": interval, "host": host}, samples)
++    network = None
++    if obj.get("network") is not None:
++        try:
++            network = _network(obj["network"], now, skew)
++        except SchemaError:
++            network = None      # campo auxiliar: se vier malformado, descarta SÓ ele; as métricas continuam valendo
++    return ({"agent_id": agent_id, "version": ver, "interval_s": interval, "host": host, "network": network}, samples)
+diff -ruN /tmp/orig/projetox-main/hub/cc_hub/server.py projetox-main/hub/cc_hub/server.py
+--- /tmp/orig/projetox-main/hub/cc_hub/server.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/hub/cc_hub/server.py	2026-11-17 02:51:03.120668584 +0000
+@@ -247,6 +247,11 @@
+         gate = _viewer_gate()
+         return gate if gate else jsonify(fleet.snapshot())
+ 
++    @app.get("/api/v1/network")
++    def network_snapshot():
++        gate = _viewer_gate()
++        return gate if gate else jsonify(fleet.network_snapshot())
++
+     @app.get("/api/v1/stream")
+     def stream():
+         gate = _viewer_gate()
+diff -ruN /tmp/orig/projetox-main/hub/tests/test_hub.py projetox-main/hub/tests/test_hub.py
+--- /tmp/orig/projetox-main/hub/tests/test_hub.py	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/hub/tests/test_hub.py	2026-11-17 02:51:03.120912679 +0000
+@@ -66,6 +66,52 @@
+     def status(self, aid="pc-principal"):
+         return {a["id"]: a for a in self.viewer().get_json()["agents"]}[aid]
+ 
++    # ---- dispositivos da rede (payload do agente -> hub -> painel)
++    def net_payload(self, **over):
++        n = {"scanned_at": self.clock.t - 3, "subnet": "192.168.0.0/24", "devices": [
++            {"ip": "192.168.0.1", "mac": "A4:2B:B0:1C:55:90", "name": "Roteador", "status": "online",
++             "latency_ms": 1.8, "method": "icmp", "last_seen": self.clock.t - 3},
++            {"ip": "192.168.0.23", "mac": "3C:5A:B4:91:0E:D2", "name": "Celular", "status": "offline",
++             "latency_ms": None, "method": None, "last_seen": self.clock.t - 900}]}
++        n.update(over)
++        return n
++
++    def test_network_valido_e_exposto_ao_painel(self):
++        env = envelope([sample()]); env["network"] = self.net_payload()
++        r, _ = self.post(env)
++        self.assertEqual(r.status_code, 200)
++        net = {a["id"]: a for a in self.viewer("/api/v1/network").get_json()["agents"]}["pc-principal"]["network"]
++        self.assertEqual([d["ip"] for d in net["devices"]], ["192.168.0.1", "192.168.0.23"])
++        self.assertEqual(net["devices"][0]["latency_ms"], 1.8)
++        self.assertEqual(self.status()["net"], {"online": 1, "total": 2, "scanned_at": self.clock.t - 3})
++
++    def test_network_malformado_descarta_so_o_network(self):
++        env = envelope([sample()])
++        env["network"] = self.net_payload(devices=[{"ip": "999.1.1.1", "mac": "xx", "status": "online"}])
++        r, _ = self.post(env)
++        self.assertEqual(r.status_code, 200)                         # métricas continuam aceitas
++        self.assertIsNone(self.status()["net"])
++
++    def test_network_chaves_extras_e_html_nao_passam(self):
++        env = envelope([sample()]); n = self.net_payload()
++        n["devices"][0]["name"] = "<img src=x>"
++        env["network"] = n
++        r, _ = self.post(env)
++        self.assertEqual(r.status_code, 200); self.assertIsNone(self.status()["net"])
++        env["network"] = self.net_payload(); env["network"]["devices"][0]["evil"] = "x"
++        r, _ = self.post(env)
++        d = self.viewer("/api/v1/network").get_json()["agents"][0]["network"]["devices"][0]
++        self.assertNotIn("evil", d)
++
++    def test_network_antigo_nao_sobrescreve_o_novo(self):
++        e1 = envelope([sample(seq=1)]); e1["network"] = self.net_payload(scanned_at=self.clock.t - 1)
++        e2 = envelope([sample(seq=2)]); e2["network"] = self.net_payload(scanned_at=self.clock.t - 50)
++        self.post(e1); self.post(e2)
++        self.assertEqual(self.status()["net"]["scanned_at"], self.clock.t - 1)
++
++    def test_network_exige_token_de_painel(self):
++        self.assertEqual(self.viewer("/api/v1/network", token="errado").status_code, 401)
++
+     # ---- autenticação / protocolo
+     def test_agente_e_hub_assinam_igual(self):
+         body = b'{"x":1}'
+diff -ruN /tmp/orig/projetox-main/render.yaml projetox-main/render.yaml
+--- /tmp/orig/projetox-main/render.yaml	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/render.yaml	2026-11-17 02:52:53.895871425 +0000
+@@ -49,4 +49,4 @@
+         value: camera=(), microphone=(self), geolocation=(), payment=(), usb=()
+       - path: /*
+         name: Content-Security-Policy
+-        value: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; connect-src 'self' https: http:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
++        value: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; connect-src 'self' https: http: wss: ws:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+diff -ruN /tmp/orig/projetox-main/web/css/hud.css projetox-main/web/css/hud.css
+--- /tmp/orig/projetox-main/web/css/hud.css	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/web/css/hud.css	2026-11-17 02:52:26.737415669 +0000
+@@ -35,6 +35,11 @@
+ .link[data-s=ok] i{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+ .link[data-s=bad] i{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+ .link[data-s=bad]{color:var(--bad)}
++/* reconectando: ponto âmbar pulsando (só opacity = composição na GPU, custo ~0) */
++.link[data-s=wait]{color:var(--warn)}
++.link[data-s=wait] i{background:var(--warn);animation:linkpulse 1.6s ease-in-out infinite}
++@keyframes linkpulse{50%{opacity:.3}}
++body.stale main{opacity:.78;transition:opacity .4s}
+ .ibtn{width:46px;height:46px;border-radius:12px;background:var(--panel);border:1px solid var(--line);display:grid;place-items:center;flex:none}
+ .ibtn svg{width:22px;height:22px}
+ .ibtn:active{background:var(--panel2)}
+@@ -134,6 +139,12 @@
+ .btn.danger{background:none;border:1px solid var(--bad);color:var(--bad)}
+ .btn:active{filter:brightness(.9)}
+ .btn[disabled]{opacity:.5}
++.nsum{color:var(--muted);font-size:14px}
++.card.net h3 .tag{margin-left:8px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--ice2);border:1px solid var(--line2);border-radius:99px;padding:1px 8px;vertical-align:2px}
++.card.net .meta{font-family:var(--num);letter-spacing:.02em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
++.lat{font-family:var(--num);font-size:22px;font-weight:600;color:var(--text)}
++.lat small{font-size:13px;color:var(--muted);font-weight:400}
++.lat.q-good{color:var(--ok)} .lat.q-mid{color:var(--warn)} .lat.q-bad{color:var(--bad)} .lat.none{color:var(--muted)}
+ .dgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
+ .card{background:linear-gradient(180deg,var(--panel),rgba(11,18,28,.4));border:1px solid var(--line);border-radius:16px;padding:16px;display:grid;gap:10px;align-content:start}
+ .card.is-off{opacity:.7}
+@@ -211,6 +222,6 @@
+   .bar{padding:8px 16px} .typebox{display:none}
+ }
+ @media (prefers-reduced-motion:reduce){
+-  .spin,.core .voice{animation:none!important}
++  .spin,.core .voice,.link i{animation:none!important}
+   .sw::after,.toast{transition:none}
+ }
+diff -ruN /tmp/orig/projetox-main/web/index.html projetox-main/web/index.html
+--- /tmp/orig/projetox-main/web/index.html	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/web/index.html	2026-11-17 02:52:26.737154109 +0000
+@@ -27,6 +27,7 @@
+     <nav class="seg" aria-label="Seções">
+       <button class="on" data-v="home">Início</button>
+       <button data-v="devices">Aparelhos</button>
++      <button data-v="net">Rede</button>
+     </nav>
+     <div class="bar-r">
+       <span class="link" id="link" role="status"><i></i><span id="linkTxt">conectando…</span></span>
+@@ -101,6 +102,16 @@
+       </div>
+       <div class="dgrid" id="dgrid"></div>
+     </section>
++
++    <!-- ============ REDE LOCAL (dispositivos reais, tempo real) ============ -->
++    <section class="devs" id="v-net" hidden>
++      <div class="dhead">
++        <h1>Rede local</h1>
++        <span class="nsum" id="netSummary" role="status">&nbsp;</span>
++      </div>
++      <p class="noitems" id="nempty" hidden></p>
++      <div class="dgrid" id="ngrid"></div>
++    </section>
+   </main>
+ </div>
+ 
+diff -ruN /tmp/orig/projetox-main/web/js/hud-core.js projetox-main/web/js/hud-core.js
+--- /tmp/orig/projetox-main/web/js/hud-core.js	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/web/js/hud-core.js	2026-11-17 02:52:57.160017251 +0000
+@@ -40,27 +40,114 @@
+     } finally { clearTimeout(tm); }
+   }
+ 
+-  /* ---------- estado e polling ---------- */
+-  const S = { resumo: null, erro: null, ultimo: 0, lan: [], aparelhos: [], ping: {} };
+-  let timer = null, inflight = null;
++  /* ---------- estado ---------- */
++  const S = { resumo: null, erro: null, ultimo: 0, lan: [], aparelhos: [], ping: {}, scan: null };
++  const LIVE = { status: 'idle', tries: 0, nextIn: 0 };   // idle | connecting | open | retrying | auth | unsupported
++  const FRESH_MS = 12000;                                   // dado mais velho que isso = "desatualizado"
++
++  /* Atualiza o DOM só se o HTML mudou: em dias de uso contínuo evita milhares de reflows inúteis. */
++  function setHTML(el, html) { if (el._h === html) return false; el._h = html; el.innerHTML = html; return true; }
++
++  function apply(d) {                                       // ÚNICO ponto que grava dados do agente em S (WS e polling)
++    S.resumo = d; S.erro = null; S.ultimo = Date.now();
++    S.aparelhos = d.aparelhos || [];
++    const r = d.rede || {};
++    S.lan = r.lan || []; S.ping = r.ping || {}; S.scan = r.scan || null;
++    emit('data', S);
++  }
++
++  /* ---------- polling HTTP: só é usado quando o WebSocket NÃO está aberto ---------- */
++  let pollT = null, inflight = null;
+   function refresh() {
+     if (inflight) return inflight;
+     inflight = api('/api/home/resumo').then(r => {
+-      if (r.ok) {
+-        S.resumo = r.data; S.erro = null; S.ultimo = Date.now();
+-        S.aparelhos = r.data.aparelhos || []; S.lan = (r.data.rede && r.data.rede.lan) || []; S.ping = (r.data.rede && r.data.rede.ping) || {};
+-      } else { S.erro = r; }
+-      emit('data', S);
++      if (r.ok) apply(r.data); else { S.erro = r; emit('data', S); }
+       return r;
+     }).finally(() => { inflight = null; });
+     return inflight;
+   }
+-  function startPolling() {
+-    clearInterval(timer);
+-    timer = setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 3000);
++  function startPoll(ms) {
++    if (pollT) return;
++    pollT = setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, ms);
+     refresh();
+   }
+-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
++  function stopPoll() { clearInterval(pollT); pollT = null; }
++
++  /* ---------- tempo real: WebSocket com backoff exponencial + jitter ---------- */
++  const BASE_MS = 1000, CAP_MS = 30000, STABLE_MS = 10000, WATCHDOG_MS = 20000;
++  let ws = null, retryT = null, wdT = null, openedAt = 0, lastMsg = 0, wantLive = false;
++
++  const setLive = (status, extra) => { Object.assign(LIVE, { status }, extra); emit('live', LIVE); };
++  const wsUrl = () => {
++    const b = base() || location.origin;
++    if (!/^https?:/i.test(b)) return null;                  // file:// ou origem opaca: sem WebSocket
++    return b.replace(/^http/i, 'ws') + '/ws/live';
++  };
++  // "full jitter": evita vários painéis reconectando no mesmo instante depois de uma queda do agente
++  const delay = n => Math.round(BASE_MS / 2 + Math.random() * (Math.min(CAP_MS, BASE_MS * 2 ** n) - BASE_MS / 2));
++
++  function teardown(sock) {                                 // fecha sem esperar o handshake (socket meio-aberto)
++    if (!sock) return;
++    sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
++    try { sock.close(); } catch (e) { /* já fechado */ }
++  }
++  function scheduleRetry() {
++    clearTimeout(retryT); clearInterval(wdT);
++    if (!wantLive || document.visibilityState !== 'visible') return;
++    const ms = delay(Math.max(0, LIVE.tries - 1));   // 1ª falha -> ≤1 s, depois 2, 4, 8… até 30 s
++    setLive('retrying', { nextIn: ms });
++    startPoll(5000);                                        // enquanto reconecta, o polling lento mantém dados reais ou o erro real
++    retryT = setTimeout(connect, ms);
++  }
++  function connect() {
++    clearTimeout(retryT);
++    if (!wantLive || ws || document.visibilityState !== 'visible') return;
++    const url = wsUrl();
++    if (!('WebSocket' in window) || !url) { setLive('unsupported'); startPoll(3000); return; }
++    setLive(LIVE.tries ? 'retrying' : 'connecting');
++    let sock;
++    try { sock = new WebSocket(url); } catch (e) { LIVE.tries++; scheduleRetry(); return; }
++    ws = sock; openedAt = 0;
++    sock.onopen = () => {
++      openedAt = lastMsg = Date.now();
++      sock.send(JSON.stringify({ type: 'auth', token: cfg.token || '' }));   // token fora da URL (não vai pra logs)
++      clearInterval(wdT);
++      wdT = setInterval(() => {                             // o servidor manda algo a cada ≤5 s; silêncio = conexão morta
++        if (Date.now() - lastMsg > WATCHDOG_MS) { teardown(sock); ws = null; LIVE.tries++; scheduleRetry(); }
++      }, 5000);
++    };
++    sock.onmessage = ev => {
++      lastMsg = Date.now();
++      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
++      if (m.type === 'hello') { stopPoll(); setLive('open', { nextIn: 0 }); }
++      else if (m.type === 'state' && m.data) { if (LIVE.status !== 'open') { stopPoll(); setLive('open'); } apply(m.data); }
++    };
++    sock.onerror = () => { /* o onclose sempre vem em seguida */ };
++    sock.onclose = ev => {
++      if (ws !== sock) return;
++      ws = null; clearInterval(wdT);
++      if (ev.code === 4001 || ev.code === 4003) {           // token/origem recusados: tentar de novo não adianta
++        wantLive = false; setLive(ev.code === 4001 ? 'auth' : 'unsupported'); startPoll(5000); return;   // o polling mostra o erro real
++      }
++      if (openedAt && Date.now() - openedAt >= STABLE_MS) LIVE.tries = 0;   // sessão estável: zera o backoff
++      LIVE.tries++;
++      scheduleRetry();
++    };
++  }
++  function startLive() { wantLive = true; LIVE.tries = 0; connect(); }
++  function reconnect() {                                    // após mudar endpoint/token, ou voltar a rede
++    teardown(ws); ws = null; clearTimeout(retryT); LIVE.tries = 0; stopPoll();
++    wantLive = true; connect(); refresh();
++  }
++  /* Tela apagada/aba oculta: fecha tudo (zero bateria); ao voltar, reconecta na hora e já pede um dado. */
++  document.addEventListener('visibilitychange', () => {
++    if (document.visibilityState === 'visible') { LIVE.tries = 0; startPoll(5000); connect(); }   // o hello do WS para o polling
++    else { clearTimeout(retryT); clearInterval(wdT); stopPoll(); teardown(ws); ws = null; if (LIVE.status !== 'auth') setLive('idle'); }
++  });
++  window.addEventListener('online', () => { if (wantLive) reconnect(); });
++  const connectedNow = () => LIVE.status === 'open' || (S.ultimo && !S.erro && Date.now() - S.ultimo < FRESH_MS);
++
++  function startPolling() { startLive(); startPoll(3000); }   // nome mantido: hud-home.js continua chamando startPolling()
+ 
+   /* ---------- ações compartilhadas (UI e voz) ---------- */
+   async function acao(id, a) {
+@@ -123,5 +210,5 @@
+   async function keepAwake() { try { if ('wakeLock' in navigator && document.visibilityState === 'visible') lock = await navigator.wakeLock.request('screen'); } catch (e) { /* sem suporte */ } }
+   document.addEventListener('visibilitychange', keepAwake); keepAwake();
+ 
+-  window.HUD = { $, $$, esc, cfg, saveCfg, api, S, on, emit, refresh, startPolling, acao, icon, ICONS, CAT, estado, ago, toast };
++  window.HUD = { $, $$, esc, cfg, saveCfg, api, S, LIVE, on, emit, refresh, startPolling, reconnect, connectedNow, setHTML, FRESH_MS, acao, icon, ICONS, CAT, estado, ago, toast };
+ })();
+diff -ruN /tmp/orig/projetox-main/web/js/hud-home.js projetox-main/web/js/hud-home.js
+--- /tmp/orig/projetox-main/web/js/hud-home.js	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/web/js/hud-home.js	2026-11-17 02:52:26.736596205 +0000
+@@ -1,7 +1,7 @@
+ /* Jarvis · tela inicial (rede + aparelhos ativos) e a aba Aparelhos. Tudo renderizado a partir do que o agente devolve. */
+ (() => {
+   'use strict';
+-  const { $, $$, esc, S, on, icon, CAT, estado, ago, acao, toast, refresh } = HUD;
++  const { $, $$, esc, S, LIVE, on, icon, CAT, estado, ago, acao, toast, refresh, setHTML } = HUD;
+   let filtro = 'todos';
+ 
+   /* ---------- relógio ---------- */
+@@ -13,14 +13,16 @@
+   tick(); setInterval(tick, 5000);
+ 
+   /* ---------- navegação ---------- */
++  const VIEWS = ['home', 'devices', 'net'];
+   function go(v) {
++    if (!VIEWS.includes(v)) v = 'home';
+     $$('.seg button').forEach(b => b.classList.toggle('on', b.dataset.v === v));
+-    $('#v-home').hidden = v !== 'home'; $('#v-devices').hidden = v !== 'devices';
++    $('#v-home').hidden = v !== 'home'; $('#v-devices').hidden = v !== 'devices'; $('#v-net').hidden = v !== 'net';
+     try { history.replaceState(null, '', '#' + v); } catch (e) { /* ok */ }
+   }
+   $$('.seg button').forEach(b => b.onclick = () => go(b.dataset.v));
+   $('#devAll').onclick = () => go('devices');
+-  go(location.hash === '#devices' ? 'devices' : 'home');
++  go(location.hash.slice(1));
+ 
+   /* ---------- acionamento (botões da interface) ---------- */
+   async function toggle(id, btn) {
+@@ -28,6 +30,7 @@
+     const a = d.categoria === 'rotina' ? 'acionar' : (d.power ? 'desligar' : 'ligar');
+     btn.classList.add('busy'); btn.disabled = true;
+     const r = await acao(id, a);
++    btn.classList.remove('busy'); btn.disabled = false;     // a lista pode não mudar (comando falhou): não deixa o botão preso
+     toast(r.ok ? `${d.nome}: ${a === 'acionar' ? 'rotina acionada' : a === 'ligar' ? 'ligado' : 'desligado'}` : `${d.nome}: ${r.msg}`, !r.ok);
+   }
+   document.addEventListener('click', e => {
+@@ -36,12 +39,20 @@
+ 
+   const switchBtn = d => `<button class="sw" role="switch" aria-checked="${d.power === true}" aria-label="${esc(d.nome)}" data-act="${d.id}"></button>`;
+ 
+-  /* ---------- link com o agente ---------- */
++  /* ---------- link com o agente (indicador sutil de tempo real / reconexão) ---------- */
+   function renderLink() {
+-    const l = $('#link'), t = $('#linkTxt');
+-    if (S.erro) { l.dataset.s = 'bad'; t.textContent = S.erro.kind === 'auth' ? 'token recusado' : 'agente inacessível'; l.title = S.erro.error; }
+-    else if (S.ultimo) { l.dataset.s = 'ok'; t.textContent = 'agente conectado'; l.title = ''; }
++    const l = $('#link'), t = $('#linkTxt'), set = (s, txt, title = '') => { l.dataset.s = s; t.textContent = txt; l.title = title; };
++    const fresh = HUD.connectedNow();
++    if (S.erro && S.erro.kind === 'auth') set('bad', 'token recusado', S.erro.error);
++    else if (LIVE.status === 'open') set('ok', 'ao vivo');
++    else if (fresh) set('ok', 'agente conectado', 'Tempo real indisponível: usando consulta periódica.');
++    else if (S.resumo) set('wait', LIVE.tries > 1 ? `reconectando… (${LIVE.tries})` : 'reconectando…', 'Mostrando a última leitura enquanto reconecta.');
++    else if (S.erro) set('bad', 'agente inacessível', S.erro.error);
++    else set('wait', 'conectando…');
++    document.body.classList.toggle('stale', !!S.resumo && !fresh);   // dados antigos ficam levemente esmaecidos
+   }
++  on('live', renderLink);
++  setInterval(() => { if (document.visibilityState === 'visible') renderLink(); }, 4000);   // detecta "dado ficou velho" sem evento
+ 
+   /* ---------- coluna Rede ---------- */
+   function renderNet() {
+@@ -72,10 +83,10 @@
+   function renderMini() {
+     const list = S.aparelhos.filter(d => d.categoria !== 'rotina');
+     const ul = $('#devMini'), sum = $('#devSum'), all = $('#devAll');
+-    if (!S.resumo) { sum.textContent = S.erro ? 'Sem dados do agente.' : 'Carregando…'; ul.innerHTML = ''; all.hidden = true; return; }
++    if (!S.resumo) { sum.textContent = S.erro ? 'Sem dados do agente.' : 'Carregando…'; setHTML(ul, ''); all.hidden = true; return; }
+     if (!list.length) {
+       sum.textContent = '';
+-      ul.innerHTML = `<li class="empty" style="display:block;border:0;background:none;padding:0"><p class="empty">Nenhum aparelho cadastrado ainda.</p><button class="btn" id="emptyAdd">Adicionar aparelho</button></li>`;
++      setHTML(ul, `<li class="empty" style="display:block;border:0;background:none;padding:0"><p class="empty">Nenhum aparelho cadastrado ainda.</p><button class="btn" id="emptyAdd">Adicionar aparelho</button></li>`);
+       $('#emptyAdd').onclick = () => $('#btnCfg').click();
+       all.hidden = true; return;
+     }
+@@ -84,12 +95,12 @@
+     // essencial: o que está ligado/online primeiro; offline depois (aparece o que precisa de atenção)
+     const ordem = [...lig, ...online.filter(d => d.power !== true), ...off, ...list.filter(d => d.online == null)];
+     const uniq = [...new Map(ordem.map(d => [d.id, d])).values()].slice(0, 6);
+-    ul.innerHTML = uniq.map(d => {
++    setHTML(ul, uniq.map(d => {
+       const e = estado(d);
+       return `<li class="${d.online === false ? 'is-off' : ''}"><span class="dot ${e.cls}"></span>
+         <div><b>${esc(d.nome)}</b><small>${esc(e.pw || e.txt)}</small></div>
+         ${d.controlavel ? switchBtn(d) : ''}</li>`;
+-    }).join('');
++    }).join(''));
+     all.hidden = false; all.textContent = list.length > uniq.length ? `Ver todos (${list.length})` : 'Abrir aparelhos';
+   }
+ 
+@@ -97,14 +108,14 @@
+   function renderRout() {
+     const r = S.aparelhos.filter(d => d.categoria === 'rotina' && d.controlavel), el = $('#routStrip');
+     el.hidden = !r.length; if (!r.length) return;
+-    el.innerHTML = `<span class="lbl">Rotinas</span>` + r.slice(0, 6).map(d => `<button class="chip ${d.ultimo_comando && !d.ultimo_comando.ok ? 'fail' : ''}" data-act="${d.id}">${icon('rotina')}${esc(d.nome)}</button>`).join('');
++    setHTML(el, `<span class="lbl">Rotinas</span>` + r.slice(0, 6).map(d => `<button class="chip ${d.ultimo_comando && !d.ultimo_comando.ok ? 'fail' : ''}" data-act="${d.id}">${icon('rotina')}${esc(d.nome)}</button>`).join(''));
+   }
+ 
+   /* ---------- aba Aparelhos ---------- */
+   function renderFilters() {
+     const cats = [...new Set(S.aparelhos.map(d => d.categoria))];
+     if (filtro !== 'todos' && !cats.includes(filtro)) filtro = 'todos';
+-    $('#filters').innerHTML = cats.length > 1 ? ['todos', ...cats].map(c => `<button data-f="${c}" class="${filtro === c ? 'on' : ''}">${c === 'todos' ? 'Todos' : esc(CAT[c] || c)}</button>`).join('') : '';
++    setHTML($('#filters'), cats.length > 1 ? ['todos', ...cats].map(c => `<button data-f="${c}" class="${filtro === c ? 'on' : ''}">${c === 'todos' ? 'Todos' : esc(CAT[c] || c)}</button>`).join('') : '');
+   }
+   function card(d) {
+     const e = estado(d), rot = d.categoria === 'rotina', lit = d.power === true;
+@@ -120,18 +131,56 @@
+   }
+   function renderGrid() {
+     const g = $('#dgrid');
+-    if (S.erro && !S.resumo) { g.innerHTML = `<p class="noitems">${esc(S.erro.error)}</p>`; return; }
++    if (S.erro && !S.resumo) { setHTML(g, `<p class="noitems">${esc(S.erro.error)}</p>`); return; }
+     if (!S.resumo) return;
+     const list = S.aparelhos.filter(d => filtro === 'todos' || d.categoria === filtro);
+-    if (!S.aparelhos.length) { g.innerHTML = '<p class="noitems">Nenhum aparelho cadastrado. Use “Novo aparelho” para começar.</p>'; return; }
++    if (!S.aparelhos.length) { setHTML(g, '<p class="noitems">Nenhum aparelho cadastrado. Use “Novo aparelho” para começar.</p>'); return; }
+     const rot = list.filter(d => d.categoria === 'rotina'), outros = list.filter(d => d.categoria !== 'rotina');
+-    g.innerHTML = outros.map(card).join('') + (rot.length ? `<div class="sechead">Rotinas</div>` + rot.map(card).join('') : '');
++    setHTML(g, outros.map(card).join('') + (rot.length ? `<div class="sechead">Rotinas</div>` + rot.map(card).join('') : ''));
+   }
+   $('#filters').addEventListener('click', e => { const b = e.target.closest('[data-f]'); if (b) { filtro = b.dataset.f; renderFilters(); renderGrid(); } });
+   $('#devAdd').onclick = () => { $('#btnCfg').click(); setTimeout(() => window.HUDSettings && HUDSettings.novo(), 50); };
+ 
++  /* ---------- aba Rede: um card por dispositivo REAL da LAN (vem do array rede.lan do agente) ---------- */
++  const METODO = { icmp: 'ping', tcp: 'TCP', arp: 'tabela ARP', local: 'este computador' };
++  const quality = ms => ms == null ? '' : ms < 30 ? 'q-good' : ms < 100 ? 'q-mid' : 'q-bad';
++  const nodes = new Map();                                   // mac -> { el, sig }  (reconciliação por chave)
++
++  function lanCard(d) {
++    const on = d.online === true;
++    const lat = d.latency_ms != null ? `<span class="lat ${quality(d.latency_ms)}">${d.latency_ms.toFixed(1)}<small> ms</small></span>`
++      : `<span class="lat none">${on ? '— ms' : ''}</span>`;
++    const how = on ? (METODO[d.method] || '') : (d.last_seen ? `visto ${ago(d.last_seen)}` : 'sem sinal');
++    const ic = d.role === 'Gateway' ? 'roteador' : d.role === 'Este PC' ? 'pc' : 'outro';
++    return `<div class="top"><span class="ic">${icon(ic)}</span><div style="min-width:0"><h3>${esc(d.name)}${d.role ? `<span class="tag">${esc(d.role)}</span>` : ''}</h3>
++        <div class="meta">${esc(d.ip)} · ${esc(d.mac)}</div></div></div>
++      <div class="st"><span class="dot ${on ? 'on' : 'off'}"></span><span>${on ? 'Online' : 'Offline'}</span></div>
++      <div class="row">${lat}<span class="meta">${esc(how)}</span></div>`;
++  }
++  function renderLan() {
++    const grid = $('#ngrid'), msg = $('#nempty'), sum = $('#netSummary');
++    const say = t => { msg.hidden = !t; msg.textContent = t || ''; };
++    if (!S.resumo) { say(S.erro ? S.erro.error : 'Carregando…'); sum.textContent = ''; if (S.erro) clearLan(); return; }
++    const on = S.lan.filter(d => d.online).length, sc = S.scan;
++    sum.textContent = sc ? `${on} online · ${S.lan.length - on} offline · ${sc.subnet || 'rede local'} · varredura ${ago(sc.scanned_at)}` : '';
++    say(!sc ? 'Varredura inicial em andamento… os dispositivos aparecem em instantes.' : !S.lan.length ? 'Nenhum dispositivo respondeu na varredura.' : '');
++    const seen = new Set(); let prev = null;
++    for (const d of S.lan) {
++      seen.add(d.mac);
++      let n = nodes.get(d.mac);
++      if (!n) { const el = document.createElement('article'); n = { el, sig: '' }; nodes.set(d.mac, n); }
++      const cls = `card net ${d.online ? '' : 'is-off'}`, html = lanCard(d), sig = cls + html;
++      if (n.sig !== sig) { n.el.className = cls; n.el.innerHTML = html; n.sig = sig; }   // só o card que mudou
++      const want = prev ? prev.nextSibling : grid.firstChild;
++      if (n.el !== want) grid.insertBefore(n.el, want);   // só mexe na ordem quando ela mudou
++      prev = n.el;
++    }
++    for (const [k, n] of nodes) if (!seen.has(k)) { n.el.remove(); nodes.delete(k); }
++  }
++  function clearLan() { for (const n of nodes.values()) n.el.remove(); nodes.clear(); }
++
+   on('data', () => {
+-    renderLink(); renderNet(); renderMini(); renderRout(); renderFilters(); renderGrid();
++    renderLink(); renderNet(); renderMini(); renderRout(); renderFilters(); renderGrid(); renderLan();
+   });
+   HUD.startPolling();
+ })();
+diff -ruN /tmp/orig/projetox-main/web/js/hud-settings.js projetox-main/web/js/hud-settings.js
+--- /tmp/orig/projetox-main/web/js/hud-settings.js	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/web/js/hud-settings.js	2026-11-17 02:51:31.556869479 +0000
+@@ -135,6 +135,7 @@
+     $('#cEnd').oninput = mixed; mixed();
+     $('#cSave').onclick = async () => {
+       cfg.endpoint = $('#cEnd').value.trim(); cfg.token = $('#cTok').value.trim(); saveCfg();
++      HUD.reconnect();                                     // reabre o WebSocket com o endpoint/token novos
+       const m = $('#cMsg'); m.className = 'err'; m.textContent = 'Testando…';
+       const r = await refresh();
+       m.className = r.ok ? 'err okmsg' : 'err'; m.textContent = r.ok ? 'Conectado ao agente.' : r.error;
+diff -ruN /tmp/orig/projetox-main/web/sw.js projetox-main/web/sw.js
+--- /tmp/orig/projetox-main/web/sw.js	2026-11-17 02:34:12.000000000 +0000
++++ projetox-main/web/sw.js	2026-11-17 02:52:53.897706837 +0000
+@@ -3,7 +3,7 @@
+  * - Só mexe em GET do próprio site e NUNCA em /api/ (dados reais do agente não podem vir de cache).
+  * - Para publicar uma nova versão: aumente VERSION.
+  */
+-const VERSION = 'cc-v4.0.0';
++const VERSION = 'cc-v4.1.0';
+ const SHELL = [
+   './', 'index.html', 'legado.html', 'manifest.json',
+   'css/hud.css', 'css/style.css',
+diff -ruN /tmp/orig/projetox-main/web/tests/live.test.js projetox-main/web/tests/live.test.js
+--- /tmp/orig/projetox-main/web/tests/live.test.js	1970-01-01 00:00:00.000000000 +0000
++++ projetox-main/web/tests/live.test.js	2026-11-17 02:53:03.096368723 +0000
+@@ -0,0 +1,95 @@
++// node web/tests/live.test.js  — testa o transporte ao vivo do hud-core.js com WebSocket/relógio simulados (sem navegador)
++const fs = require('fs'), vm = require('vm'), path = require('path'), assert = require('assert');
++
++function harness() {
++  let now = 1_000_000, id = 0; const timers = new Map();
++  const fake = {
++    setTimeout: (fn, ms) => { timers.set(++id, { fn, at: now + ms, ms, every: 0 }); return id; },
++    setInterval: (fn, ms) => { timers.set(++id, { fn, at: now + ms, ms, every: ms }); return id; },
++    clearTimeout: i => timers.delete(i), clearInterval: i => timers.delete(i),
++  };
++  const advance = ms => {
++    const end = now + ms;
++    for (;;) {
++      const next = [...timers.entries()].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
++      if (!next) break;
++      const [i, t] = next; now = t.at;
++      if (t.every) t.at += t.every; else timers.delete(i);
++      t.fn();
++    }
++    now = end;
++  };
++  const sockets = []; let fetches = 0;
++  class WS { constructor(url) { this.url = url; this.sent = []; sockets.push(this); } send(d) { this.sent.push(JSON.parse(d)); } close() { this.closed = true; } }
++  const doc = Object.assign(new EventTarget(), { visibilityState: 'visible', querySelector() { return null; }, querySelectorAll() { return []; } });
++  const win = Object.assign(new EventTarget(), { isSecureContext: false, WebSocket: WS });
++  const ctx = {
++    window: win, document: doc, WebSocket: WS, EventTarget, CustomEvent, AbortController, console,
++    localStorage: { getItem: () => JSON.stringify({ endpoint: 'http://192.168.0.5:5000', token: 'tok' }), setItem() {} },
++    navigator: {}, location: { origin: 'http://192.168.0.5:5000', protocol: 'http:' },
++    fetch: async () => { fetches++; return { status: 200, ok: true, json: async () => ({ ts: 1, rede: { lan: [], ping: {} }, aparelhos: [] }) }; },
++    Date: { now: () => now }, Math, JSON, Map, Set, Promise,
++    ...fake,
++  };
++  ctx.window.document = doc; ctx.window.navigator = ctx.navigator; ctx.window.addEventListener = win.addEventListener.bind(win);
++  vm.createContext(ctx);
++  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'js', 'hud-core.js'), 'utf8'), ctx);
++  return { HUD: ctx.window.HUD, sockets, advance, doc, win, fetches: () => fetches, timers };
++}
++const msg = (ws, o) => ws.onmessage({ data: JSON.stringify(o) });
++const tick = () => new Promise(r => setImmediate(r));
++let n = 0; const ok = name => console.log(`ok ${++n} - ${name}`);
++
++(async () => {
++  { // 1) conecta, autentica e recebe estado real
++    const h = harness(); h.HUD.startPolling();
++    assert.strictEqual(h.sockets.length, 1); assert.strictEqual(h.sockets[0].url, 'ws://192.168.0.5:5000/ws/live');
++    h.sockets[0].onopen(); assert.deepStrictEqual(h.sockets[0].sent[0], { type: 'auth', token: 'tok' });
++    msg(h.sockets[0], { type: 'hello', v: 1 });
++    msg(h.sockets[0], { type: 'state', seq: 1, data: { ts: 1, rede: { lan: [{ mac: 'AA', ip: '1.1.1.1', online: true, latency_ms: 3.2 }], ping: { gateway: 2 }, scan: { scanned_at: 1, subnet: 'x' } }, aparelhos: [] } });
++    assert.strictEqual(h.HUD.LIVE.status, 'open'); assert.strictEqual(h.HUD.S.lan[0].latency_ms, 3.2);
++    ok('conecta, envia token na 1ª mensagem (não na URL) e aplica o array real');
++    const f0 = h.fetches(); h.advance(30000); assert.strictEqual(h.fetches(), f0, 'WS aberto = sem polling');
++    ok('com o WebSocket aberto o polling HTTP fica parado');
++  }
++  { // 2) queda -> backoff exponencial com teto de 30 s + polling de fallback
++    const h = harness(); h.HUD.startPolling();
++    const delays = [];
++    for (let i = 0; i < 8; i++) {
++      const s = h.sockets[h.sockets.length - 1]; s.onclose({ code: 1006 });
++      assert.strictEqual(h.HUD.LIVE.status, 'retrying'); delays.push(h.HUD.LIVE.nextIn);
++      h.advance(h.HUD.LIVE.nextIn + 1);
++    }
++    delays.forEach((d, i) => { assert.ok(d >= 500 && d <= Math.min(30000, 1000 * 2 ** i), `delay[${i}]=${d}`); });
++    assert.ok(Math.max(...delays) <= 30000);
++    ok('backoff exponencial com jitter, nunca acima de 30 s: ' + delays.join(', '));
++    assert.ok(h.fetches() > 0); ok('enquanto reconecta, o polling lento busca dados reais');
++  }
++  { // 3) sessão estável zera o backoff
++    const h = harness(); h.HUD.startPolling();
++    let s = h.sockets[0]; s.onclose({ code: 1006 }); h.advance(h.HUD.LIVE.nextIn + 1);
++    s = h.sockets[1]; s.onopen(); msg(s, { type: 'hello' }); h.advance(11000); s.onclose({ code: 1006 });
++    assert.strictEqual(h.HUD.LIVE.tries, 1); ok('conexão estável por ≥10 s zera o backoff');
++  }
++  { // 4) token recusado: para de tentar
++    const h = harness(); h.HUD.startPolling();
++    h.sockets[0].onclose({ code: 4001 }); h.advance(120000);
++    assert.strictEqual(h.sockets.length, 1); assert.strictEqual(h.HUD.LIVE.status, 'auth'); ok('4001 (token recusado) não entra em loop de reconexão');
++  }
++  { // 5) watchdog: silêncio de 20 s derruba e reconecta
++    const h = harness(); h.HUD.startPolling();
++    const s = h.sockets[0]; s.onopen(); msg(s, { type: 'hello' });
++    h.advance(26000); assert.ok(s.closed, 'fechou o socket mudo'); assert.strictEqual(h.HUD.LIVE.status, 'retrying'); h.advance(31000);
++    assert.strictEqual(h.sockets.length, 2); ok('watchdog detecta conexão meio-aberta e reconecta');
++  }
++  { // 6) aba oculta fecha tudo; ao voltar reconecta na hora
++    const h = harness(); h.HUD.startPolling();
++    const s = h.sockets[0]; s.onopen(); msg(s, { type: 'hello' });
++    await tick(); await tick();                     // deixa o fetch inicial (do startPoll) terminar e limpar o timer de aborto
++    h.doc.visibilityState = 'hidden'; h.doc.dispatchEvent(new Event('visibilitychange'));
++    assert.ok(s.closed); assert.strictEqual(h.timers.size, 0, 'nenhum timer vivo com a tela apagada'); h.advance(600000); assert.strictEqual(h.sockets.length, 1);
++    h.doc.visibilityState = 'visible'; h.doc.dispatchEvent(new Event('visibilitychange'));
++    assert.strictEqual(h.sockets.length, 2); ok('tela apagada = zero timers/socket; ao acordar reconecta imediatamente');
++  }
++  console.log(`\n${n} verificações passaram`);
++})().catch(e => { console.error(e); process.exit(1); });
+diff -ruN /tmp/orig/projetox-main/web/tests/render.test.js projetox-main/web/tests/render.test.js
+--- /tmp/orig/projetox-main/web/tests/render.test.js	1970-01-01 00:00:00.000000000 +0000
++++ projetox-main/web/tests/render.test.js	2026-11-17 02:53:42.383888560 +0000
+@@ -0,0 +1,65 @@
++// node web/tests/render.test.js — renderização dos cards reais da LAN (DOM simulado, sem navegador)
++process.on('uncaughtException', e => { console.error('ERRO NO LISTENER:', e); process.exit(1); });
++const fs = require('fs'), vm = require('vm'), path = require('path'), assert = require('assert');
++
++class El {
++  constructor() { this.childNodes = []; this.parent = null; this.hidden = false; this.dataset = {}; this._html = ''; this.htmlSets = 0; this.textContent = ''; this.className = '';
++    const set = new Set(); this.classList = { toggle: (c, on) => (on ? set.add(c) : set.delete(c)), add: c => set.add(c), remove: c => set.delete(c), contains: c => set.has(c) }; }
++  get innerHTML() { return this._html; } set innerHTML(v) { this._html = v; this.htmlSets++; }
++  get firstChild() { return this.childNodes[0] || null; }
++  get nextSibling() { return this.parent ? this.parent.childNodes[this.parent.childNodes.indexOf(this) + 1] || null : null; }
++  insertBefore(n, ref) { if (n.parent) n.remove(); const i = ref ? this.childNodes.indexOf(ref) : this.childNodes.length; this.childNodes.splice(i, 0, n); n.parent = this; return n; }
++  remove() { if (this.parent) { this.parent.childNodes.splice(this.parent.childNodes.indexOf(this), 1); this.parent = null; } }
++  addEventListener() {} click() {} setAttribute() {}
++}
++const els = new Map(); const q = s => (els.has(s) || els.set(s, new El()), els.get(s));
++const doc = Object.assign(new EventTarget(), { visibilityState: 'visible', body: new El(), querySelector: q, querySelectorAll: () => [], createElement: () => new El() });
++const win = Object.assign(new EventTarget(), { isSecureContext: false });
++const ctx = { window: win, document: doc, EventTarget, CustomEvent, AbortController, console, navigator: {}, location: { origin: 'http://x', protocol: 'http:', hash: '#net' },
++  performance, history: { replaceState() {} }, localStorage: { getItem: () => '{}', setItem() {} }, fetch: () => new Promise(() => {}), setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, Date, Math, JSON, Map, Set, Promise,
++  WebSocket: class { constructor() {} send() {} close() {} } };
++ctx.window = ctx; ctx.addEventListener = () => {}; ctx.isSecureContext = false;      // no navegador window === globalThis
++vm.createContext(ctx);
++for (const f of ['hud-core.js', 'hud-home.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'js', f), 'utf8'), ctx);
++const HUD = ctx.HUD; const S = HUD.S;
++
++const dev = (o) => ({ name: 'x', ip: '192.168.0.2', mac: 'AA:00:00:00:00:02', online: true, status: 'online', latency_ms: 5, method: 'icmp', role: null, last_seen: Date.now() / 1000, ago: null, ...o });
++const push = (lan) => { S.resumo = { ok: 1 }; S.erro = null; S.ultimo = Date.now(); S.lan = lan; S.aparelhos = []; S.ping = {}; S.scan = { scanned_at: Date.now() / 1000, subnet: '192.168.0.0/24' }; HUD.emit('data', S); };
++const grid = q('#ngrid'); let n = 0; const ok = m => console.log(`ok ${++n} - ${m}`);
++
++const A = dev({ name: 'Roteador', ip: '192.168.0.1', mac: 'AA:00:00:00:00:01', latency_ms: 12.34, role: 'Gateway' });
++const B = dev({ name: 'Celular', ip: '192.168.0.23', mac: 'AA:00:00:00:00:23', latency_ms: 140 });
++const C = dev({ name: 'TV', ip: '192.168.0.62', mac: 'AA:00:00:00:00:62', latency_ms: null, method: 'arp' });
++push([A, B, C]);
++assert.strictEqual(grid.childNodes.length, 3);
++assert.match(grid.childNodes[0].innerHTML, /12\.3/); assert.match(grid.childNodes[0].innerHTML, /Gateway/); assert.match(grid.childNodes[1].innerHTML, /q-bad/); assert.match(grid.childNodes[2].innerHTML, /— ms/);
++ok('renderiza um card por dispositivo com IP, MAC, status e latência (cores por faixa; sem latência = "— ms", nunca número inventado)');
++
++const ids = [...grid.childNodes], sets = ids.map(e => e.htmlSets);
++push([A, B, C]);
++assert.deepStrictEqual([...grid.childNodes], ids); assert.deepStrictEqual(grid.childNodes.map(e => e.htmlSets), sets);
++ok('mesma leitura = nenhum nó recriado e nenhum innerHTML reescrito (custo ~0 de CPU)');
++
++push([A, { ...B, latency_ms: 20 }, C]);
++assert.deepStrictEqual(grid.childNodes.map(e => e.htmlSets), [sets[0], sets[1] + 1, sets[2]]); assert.match(grid.childNodes[1].innerHTML, /q-good/);
++ok('mudou a latência de 1 aparelho = só aquele card é atualizado');
++
++push([A, C, { ...B, online: false, status: 'offline', latency_ms: null, ago: 99, last_seen: Date.now() / 1000 - 99 }]);
++assert.strictEqual(grid.childNodes[2], ids[1]); assert.match(grid.childNodes[2].className, /is-off/); assert.match(grid.childNodes[2].innerHTML, /Offline/);
++ok('dispositivo que caiu vai para o fim e fica "Offline" reaproveitando o mesmo elemento');
++
++push([A, C]);
++assert.strictEqual(grid.childNodes.length, 2); ok('dispositivo que sumiu da lista é removido do DOM');
++
++push([]); assert.strictEqual(grid.childNodes.length, 0); assert.strictEqual(q('#nempty').hidden, false); assert.match(q('#nempty').textContent, /Nenhum dispositivo/);
++ok('lista vazia com varredura concluída mostra mensagem real, sem cards');
++
++S.scan = null; S.lan = []; HUD.emit('data', S); assert.match(q('#nempty').textContent, /inicial em andamento/);
++ok('antes da 1ª varredura mostra "em andamento" em vez de "nenhum dispositivo"');
++
++HUD.LIVE.status = 'open'; HUD.emit('live', HUD.LIVE); assert.strictEqual(q('#link').dataset.s, 'ok'); assert.strictEqual(q('#linkTxt').textContent, 'ao vivo');
++HUD.LIVE.status = 'retrying'; HUD.LIVE.tries = 3; S.ultimo = Date.now() - 60000; HUD.emit('live', HUD.LIVE);
++assert.strictEqual(q('#link').dataset.s, 'wait'); assert.match(q('#linkTxt').textContent, /reconectando… \(3\)/); assert.ok(doc.body.classList.contains('stale'));
++ok('indicador: "ao vivo" → "reconectando… (n)" com a tela esmaecida; última leitura continua visível');
++S.erro = { kind: 'auth', error: 'x' }; HUD.emit('live', HUD.LIVE); assert.strictEqual(q('#linkTxt').textContent, 'token recusado'); ok('token recusado aparece como erro, não como "reconectando"');
++console.log(`\n${n} verificações passaram`);
