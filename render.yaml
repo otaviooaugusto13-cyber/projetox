@@ -19,7 +19,7 @@ services:
       - key: CC_AGENTS
         value: "pc-principal:PC Principal,notebook:Notebook"
       - key: CC_ALLOWED_ORIGINS
-        value: "https://command-center.onrender.com"   # troque pela URL real do seu site estático
+        value: "https://tablet-oq65.onrender.com"      # URL do painel. SEM isso o navegador bloqueia o painel (CORS). Vários: separe por vírgula
       - key: CC_TRUST_PROXY
         value: "1"
 
