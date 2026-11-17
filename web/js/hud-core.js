@@ -25,7 +25,9 @@
    * Com o hub configurado e sem endereço de agente, NENHUMA chamada vai ao agente (antes iam à mesma origem do Render → HTTP 404). */
   const hubBase = () => (cfg.hubUrl || '').trim().replace(/\/+$/, '');
   const hubOn = () => !!(cfg.hubToken && hubBase());
-  const agentOn = () => !!((cfg.endpoint || '').trim() || !hubOn());
+  // Endereço http:// guardado de antes + painel em HTTPS = o Chrome SEMPRE bloqueia (mixed content). Com hub configurado, ignora-o em vez de mostrar "Agente inacessível".
+  const agentBlocked = () => location.protocol === 'https:' && /^http:\/\/(?!localhost|127\.0\.0\.1)/i.test((cfg.endpoint || '').trim());
+  const agentOn = () => (cfg.endpoint || '').trim() ? !(hubOn() && agentBlocked()) : !hubOn();
 
   /* ---------- API do agente ---------- */
   const base = () => (cfg.endpoint || '').trim().replace(/\/+$/, '');
