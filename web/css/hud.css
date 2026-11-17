@@ -204,6 +204,27 @@ code{font:13px ui-monospace,Consolas,monospace;background:var(--bg);border:1px s
 .toast.show{opacity:1;transform:translate(-50%,0)}
 .toast.bad{border-color:var(--bad);color:#ffd9dd}
 
+/* ---------- Frota (hardware via hub) ---------- */
+.dot.warn{background:var(--warn);box-shadow:0 0 8px var(--warn)} .dot.ghost{background:#9a6bff}
+.card.fleet .st .meta b{color:var(--text);font-weight:600}
+.fbar{display:grid;grid-template-columns:52px 1fr 44px;align-items:center;gap:10px;font-size:13px;color:var(--muted)}
+.fbar .ftrack{height:8px;border-radius:99px;background:var(--panel2);overflow:hidden}
+.fbar .ftrack i{display:block;height:100%;border-radius:99px;background:var(--ice2);transition:width .6s ease}
+.fbar b{font:600 15px var(--num);color:var(--text);text-align:right;font-variant-numeric:tabular-nums}
+.fbar.mid .ftrack i{background:var(--warn)} .fbar.mid b{color:var(--warn)}
+.fbar.bad .ftrack i{background:var(--bad)} .fbar.bad b{color:var(--bad)}
+.fspk{width:100%;height:44px;display:block}
+.fspk polyline{fill:none;stroke:var(--ice2);stroke-width:1.6;vector-effect:non-scaling-stroke;stroke-linejoin:round}
+.fchips{display:flex;flex-wrap:wrap;gap:6px}
+.fchip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line2);border-radius:99px;padding:2px 10px;font-size:12px;color:var(--muted)}
+.freasons{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.freasons li{color:var(--warn)} .freasons li.crit{color:var(--bad)}
+.fev-h{font-size:15px;color:var(--muted);margin:26px 0 10px}
+.fev{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.fev li{display:flex;gap:12px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;color:var(--muted)}
+.fev li.warn{border-color:var(--warn);color:var(--warn)} .fev li.bad{border-color:var(--bad);color:#ffd9dd}
+.fev time{font-family:var(--num);flex:none} .fev em{font-style:normal;font-family:var(--num);opacity:.7}
+
 /* ---------- telas menores / retrato ---------- */
 @media (max-width:1000px),(orientation:portrait){
   html,body{overflow:auto}
@@ -225,3 +246,4 @@ code{font:13px ui-monospace,Consolas,monospace;background:var(--bg);border:1px s
   .spin,.core .voice,.link i{animation:none!important}
   .sw::after,.toast{transition:none}
 }
+
