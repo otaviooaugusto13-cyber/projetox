@@ -3,11 +3,11 @@
  * - Só mexe em GET do próprio site e NUNCA em /api/ (dados reais do agente não podem vir de cache).
  * - Para publicar uma nova versão: aumente VERSION.
  */
-const VERSION = 'cc-v4.1.0';
+const VERSION = 'cc-v4.2.0';
 const SHELL = [
   './', 'index.html', 'legado.html', 'manifest.json',
   'css/hud.css', 'css/style.css',
-  'js/hud-core.js', 'js/jarvis-nlu.js', 'js/jarvis.js', 'js/hud-home.js', 'js/hud-settings.js',
+  'js/hud-core.js', 'js/jarvis-nlu.js', 'js/jarvis.js', 'js/hud-home.js', 'js/hud-fleet.js', 'js/hud-settings.js',
   'js/config.js', 'js/app.js', 'js/sentinel.js', 'js/fleet.js', 'js/settings.js', 'js/pwa.js',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-64.png',
 ];
